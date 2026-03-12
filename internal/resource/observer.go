@@ -19,9 +19,9 @@ import (
 )
 
 var (
-	_ resource.Resource                = &Observer{}
-	_ resource.ResourceWithConfigure   = &Observer{}
-	_ resource.ResourceWithModifyPlan  = &Observer{}
+	_ resource.Resource               = &Observer{}
+	_ resource.ResourceWithConfigure  = &Observer{}
+	_ resource.ResourceWithModifyPlan = &Observer{}
 )
 
 // Observer is a Terraform resource that collects local identity, git context,
@@ -108,7 +108,7 @@ func (r *Observer) Create(ctx context.Context, req resource.CreateRequest, resp 
 
 	result := r.collect(ctx)
 	now := time.Now().UTC().Format(time.RFC3339)
-
+	fmt.Println("Observer collected data:", result)
 	apiResp, err := r.client.Post(ctx, observer.ObserverPayload{
 		Identity:    result.Identity,
 		Git:         result.Git,

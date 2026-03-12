@@ -12,6 +12,22 @@ import (
 )
 
 // collectAWS detects AWS credentials and calls STS GetCallerIdentity.
+//
+// This follows the standard AWS credential resolution chain:
+//  1. Environment variables (AWS_ACCESS_KEY_ID, AWS_PROFILE, etc.)
+//  2. Shared credentials file (~/.aws/credentials)
+//  3. Shared config file (~/.aws/config) — respects AWS_PROFILE / default
+//  4. ECS container credentials (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)
+//  5. EC2 instance metadata / EKS IRSA (AWS_WEB_IDENTITY_TOKEN_FILE)
+//
+// The aws-sdk-go-v2 LoadDefaultConfig handles all of these.
+// If the environment has no resolvable AWS credentials, this collector returns nil.
+//
+// NOTE: Terraform's provider "aws" { profile = "X" } sets the profile internally
+// for its own SDK calls. This does NOT propagate to our provider process.
+// Users must set AWS_PROFILE in their shell for the collector to pick it up:
+//
+//	export AWS_PROFILE=my-profile && terraform apply
 func (c *Collector) collectAWS(ctx context.Context) *CloudIdentity {
 	if !c.hasAWSCredentials() {
 		return nil
@@ -30,17 +46,7 @@ func (c *Collector) collectAWS(ctx context.Context) *CloudIdentity {
 	output, err := stsCaller.GetCallerIdentity(ctx)
 	if err != nil {
 		tflog.Warn(ctx, "AWS GetCallerIdentity failed", map[string]interface{}{"error": err.Error()})
-		// Return partial data from env vars if available
-		accountID := c.Env.Getenv("AWS_ACCOUNT_ID")
-		if accountID == "" {
-			return nil
-		}
-		return &CloudIdentity{
-			Provider:  "aws",
-			AccountID: accountID,
-			AuthType:  "unknown",
-			AWS:       &AWSIdentity{AccountID: accountID, RoleType: "unknown"},
-		}
+		return nil
 	}
 
 	awsID := parseAWSARN(output.ARN)
@@ -56,30 +62,44 @@ func (c *Collector) collectAWS(ctx context.Context) *CloudIdentity {
 	}
 }
 
-// hasAWSCredentials checks if AWS credentials are available via env vars or credential files.
+// hasAWSCredentials checks if AWS credentials are likely available.
+// This is a fast, non-network check to avoid unnecessary STS calls.
 func (c *Collector) hasAWSCredentials() bool {
-	// Check env var credentials
+	// Explicit credentials via env vars
 	if c.Env.Getenv("AWS_ACCESS_KEY_ID") != "" {
 		return true
 	}
+	// Named profile selected
 	if c.Env.Getenv("AWS_PROFILE") != "" {
+		return true
+	}
+	if c.Env.Getenv("AWS_DEFAULT_PROFILE") != "" {
 		return true
 	}
 	// ECS container credentials
 	if c.Env.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" {
 		return true
 	}
-	// Web identity token (EKS IRSA)
+	// EKS IRSA / Web identity
 	if c.Env.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
 		return true
 	}
-	// Check default credentials file
+	// SSO session token
+	if c.Env.Getenv("AWS_SESSION_TOKEN") != "" {
+		return true
+	}
+
+	// Shared credentials or config files exist
 	home, err := os.UserHomeDir()
 	if err == nil {
 		if _, err := c.FS.Stat(home + "/.aws/credentials"); err == nil {
 			return true
 		}
+		if _, err := c.FS.Stat(home + "/.aws/config"); err == nil {
+			return true
+		}
 	}
+
 	return false
 }
 
@@ -94,7 +114,6 @@ func (c *Collector) hasAWSCredentials() bool {
 func parseAWSARN(arn string) *AWSIdentity {
 	id := &AWSIdentity{ARN: arn}
 
-	// arn:partition:service:region:account:resource
 	parts := strings.SplitN(arn, ":", 6)
 	if len(parts) < 6 {
 		id.RoleType = "unknown"
@@ -112,7 +131,6 @@ func parseAWSARN(arn string) *AWSIdentity {
 
 	case strings.HasPrefix(resource, "assumed-role/"):
 		id.RoleType = "assumed-role"
-		// assumed-role/RoleName/SessionName
 		roleParts := strings.SplitN(resource, "/", 3)
 		if len(roleParts) >= 2 {
 			id.RoleARN = "arn:" + parts[1] + ":iam::" + parts[4] + ":role/" + roleParts[1]

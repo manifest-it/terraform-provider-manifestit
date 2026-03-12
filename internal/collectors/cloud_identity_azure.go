@@ -19,9 +19,20 @@ type azureJWTClaims struct {
 	Subject     string `json:"sub"`
 }
 
-// collectAzure detects Azure credentials and extracts identity from JWT token claims or env vars.
+// azureAccountInfo holds fields from `az account show --output json`.
+type azureAccountInfo struct {
+	ID       string `json:"id"`       // subscription ID
+	TenantID string `json:"tenantId"`
+	Name     string `json:"name"`     // subscription name
+	User     struct {
+		Name string `json:"name"`
+		Type string `json:"type"` // "user", "servicePrincipal"
+	} `json:"user"`
+}
+
+// collectAzure detects Azure credentials and extracts identity from JWT token claims, env vars, or az CLI.
 func (c *Collector) collectAzure(ctx context.Context) *CloudIdentity {
-	authType := c.detectAzureAuthType()
+	authType := c.detectAzureAuthType(ctx)
 	if authType == "" {
 		return nil
 	}
@@ -54,9 +65,17 @@ func (c *Collector) collectAzure(ctx context.Context) *CloudIdentity {
 		}
 	}
 
+	// For CLI auth, enrich from `az account show` if we still lack details
+	if authType == "user-cli" && azureID.SubscriptionID == "" {
+		c.enrichAzureFromCLI(ctx, azureID)
+	}
+
 	principalID := azureID.ObjectID
 	if principalID == "" {
 		principalID = azureID.ClientID
+	}
+	if principalID == "" {
+		principalID = azureID.UPN
 	}
 
 	return &CloudIdentity{
@@ -69,8 +88,8 @@ func (c *Collector) collectAzure(ctx context.Context) *CloudIdentity {
 	}
 }
 
-// detectAzureAuthType determines the Azure authentication method from env vars.
-func (c *Collector) detectAzureAuthType() string {
+// detectAzureAuthType determines the Azure authentication method from env vars or az CLI session.
+func (c *Collector) detectAzureAuthType(ctx context.Context) string {
 	switch {
 	case c.Env.Getenv("ARM_CLIENT_ID") != "" && c.Env.Getenv("ARM_CLIENT_SECRET") != "":
 		return "service-principal"
@@ -81,11 +100,55 @@ func (c *Collector) detectAzureAuthType() string {
 	case c.Env.Getenv("ARM_USE_CLI") == "true" || c.Env.Getenv("AZURE_CLI_AUTH") != "":
 		return "user-cli"
 	case c.Env.Getenv("ARM_TENANT_ID") != "":
-		// Tenant ID present but no specific auth method identified;
-		// Azure credentials may still be configured via other means
 		return "user-cli"
-	default:
-		return ""
+	case c.Env.Getenv("ARM_SUBSCRIPTION_ID") != "":
+		return "user-cli"
+	case c.Env.Getenv("ARM_ACCESS_TOKEN") != "":
+		return "user-cli"
+	}
+
+	// Last resort: check if az CLI has an active session.
+	// The azurerm provider defaults to CLI auth, so this is the common local dev path.
+	if c.Cmd != nil {
+		if out, err := c.Cmd.Run(ctx, "", "az", "account", "show", "--output", "json"); err == nil && out != "" {
+			return "user-cli"
+		}
+	}
+
+	return ""
+}
+
+// enrichAzureFromCLI extracts identity info from `az account show`.
+func (c *Collector) enrichAzureFromCLI(ctx context.Context, id *AzureIdentity) {
+	if c.Cmd == nil {
+		return
+	}
+
+	out, err := c.Cmd.Run(ctx, "", "az", "account", "show", "--output", "json")
+	if err != nil {
+		tflog.Debug(ctx, "az account show failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	var acct azureAccountInfo
+	if err := json.Unmarshal([]byte(out), &acct); err != nil {
+		tflog.Debug(ctx, "failed to parse az account show", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	if acct.ID != "" && id.SubscriptionID == "" {
+		id.SubscriptionID = acct.ID
+	}
+	if acct.TenantID != "" && id.TenantID == "" {
+		id.TenantID = acct.TenantID
+	}
+	if acct.User.Name != "" {
+		if id.UPN == "" {
+			id.UPN = acct.User.Name
+		}
+		if id.DisplayName == "" {
+			id.DisplayName = acct.User.Name
+		}
 	}
 }
 
