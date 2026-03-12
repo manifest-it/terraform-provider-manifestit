@@ -1,0 +1,14 @@
+.vscode
+.DS_Store
+/.env
+# excluding example env
+!.env.example
+*.toml
+.idea
+bin/
+__debug_*
+internal/.DS_Store
+your_temporal.db
+workflow_actions_new.go
+kube-deployment.yaml
+.claude
