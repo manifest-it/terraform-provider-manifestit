@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	resource2 "terraform-provider-manifestit/internal/resource"
 	"terraform-provider-manifestit/pkg/sdk/providers"
 	"terraform-provider-manifestit/pkg/utils"
 	"time"
@@ -49,7 +50,7 @@ func New() provider.Provider {
 
 func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		NewChangelog,
+		resource2.NewObserver,
 	}
 }
 
@@ -159,14 +160,14 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 	resp.Schema = schema.Schema{
 		Attributes: map[string]schema.Attribute{
 			"api_key": schema.StringAttribute{
-				Optional:    false,
+				Optional:    true,
 				Sensitive:   true,
-				Description: "(Required unless validate is false) ManifestIT API key. This can also be set via the API_KEY environment variable.",
+				Description: "(Required unless validate is false) ManifestIT API key. This can also be set via the MIT_API_KEY environment variable.",
 			},
 			"api_url": schema.StringAttribute{
-				Optional:    false,
+				Optional:    true,
 				Sensitive:   true,
-				Description: "The API URL. This can also be set via the MANIFESTIT_HOST environment variable, and defaults to `https://api.manifestit.tech`",
+				Description: "The API URL. This can also be set via the MIT_HOST environment variable, and defaults to `https://api.manifestit.tech`",
 			},
 			"validate": schema.StringAttribute{
 				Optional:    true,
@@ -174,7 +175,7 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 				Description: "Enables validation of the provided API key during provider initialization. Valid values are [`true`, `false`]. Default is true. When false, api_key won't be checked.",
 			},
 			"org_id": schema.StringAttribute{
-				Optional:    false,
+				Optional:    true,
 				Sensitive:   true,
 				Description: "The organization ID",
 			},
