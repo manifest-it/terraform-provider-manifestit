@@ -5,7 +5,7 @@ import (
 
 	"terraform-provider-manifestit/pkg/sdk"
 	"terraform-provider-manifestit/pkg/sdk/auth"
-	"terraform-provider-manifestit/pkg/sdk/providers/changelog"
+	"terraform-provider-manifestit/pkg/sdk/providers/observer"
 
 	"github.com/rs/zerolog"
 )
@@ -22,9 +22,9 @@ type Config struct {
 }
 
 // ProviderClient holds per-resource API clients.
-// Add a new field here for each resource the provider supports.
 type ProviderClient struct {
-	Changelog changelog.Client
+	Observer observer.Client
+	OrgID    string
 }
 
 // NewProviderClient builds a ProviderClient from the given Config.
@@ -56,6 +56,7 @@ func NewProviderClient(cfg Config) (*ProviderClient, error) {
 	})
 
 	return &ProviderClient{
-		Changelog: changelog.New(api),
+		Observer: observer.New(api),
+		OrgID:    cfg.OrgID,
 	}, nil
 }
