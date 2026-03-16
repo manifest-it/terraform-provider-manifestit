@@ -155,3 +155,9 @@ const MITHTTPRetryBackoffBase = "MIT_HTTP_CLIENT_RETRY_BACKOFF_BASE"
 
 // MITHTTPRetryMaxRetries name of env var for max retries
 const MITHTTPRetryMaxRetries = "MIT_HTTP_CLIENT_RETRY_MAX_RETRIES"
+
+// MITTrackedBranch name of env var for tracked branch
+const MITTrackedBranch = "MIT_TRACKED_BRANCH"
+
+// MITTrackedRepo name of env var for tracked repository URL
+const MITTrackedRepo = "MIT_TRACKED_REPO"

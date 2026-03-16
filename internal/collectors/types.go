@@ -14,7 +14,28 @@ type CollectionResult struct {
 	Identity    LocalIdentity   `json:"identity"`
 	Git         GitContext       `json:"git"`
 	Cloud       []CloudIdentity `json:"cloud,omitempty"`
+	State       StateMetadata   `json:"state"`
 	CollectedAt time.Time       `json:"collected_at"`
+}
+
+// StateMetadata holds Terraform state correlation data (lineage, serial, backend config).
+type StateMetadata struct {
+	Available        bool           `json:"available"`
+	Lineage          string         `json:"lineage,omitempty"`
+	Serial           int64          `json:"serial,omitempty"`
+	TerraformVersion string         `json:"terraform_version,omitempty"`
+	Backend          *BackendConfig `json:"backend,omitempty"`
+}
+
+// BackendConfig describes the Terraform backend used to store state.
+type BackendConfig struct {
+	Type               string `json:"type"`                             // "s3", "azurerm", "gcs", "local"
+	Bucket             string `json:"bucket,omitempty"`                 // S3 / GCS bucket name
+	Key                string `json:"key,omitempty"`                    // S3 object key / Azure blob name
+	Region             string `json:"region,omitempty"`                 // S3 region
+	StorageAccountName string `json:"storage_account_name,omitempty"`   // Azure storage account
+	ContainerName      string `json:"container_name,omitempty"`         // Azure blob container
+	Prefix             string `json:"prefix,omitempty"`                 // GCS prefix
 }
 
 // LocalIdentity identifies the human or system account initiating the Terraform run.
@@ -41,22 +62,29 @@ type LocalIdentity struct {
 	CIActor    string `json:"ci_actor,omitempty"`
 }
 
-// GitContext captures code provenance from the Git repository.
+// GitContext captures compliance-focused git provenance.
+// Minimal HEAD info + tracked branch compliance data.
 type GitContext struct {
-	Available       bool      `json:"available"`
-	Commit          string    `json:"commit"`
-	CommitShort     string    `json:"commit_short"`
-	Branch          string    `json:"branch"`
-	Dirty           bool      `json:"dirty"`
-	CommitAuthor    string    `json:"commit_author"`
-	CommitEmail     string    `json:"commit_email"`
-	CommitMessage   string    `json:"commit_message"`
-	CommitTimestamp time.Time `json:"commit_timestamp"`
-	LocalGitName    string    `json:"local_git_name,omitempty"`
-	LocalGitEmail   string    `json:"local_git_email,omitempty"`
-	RemoteURL       string    `json:"remote_url"`
-	PRNumber        string    `json:"pr_number,omitempty"`
-	Tags            []string  `json:"tags,omitempty"`
+	Available   bool   `json:"available"`
+	Commit      string `json:"commit"`                  // HEAD commit hash
+	Branch      string `json:"branch"`                  // current branch name
+	Dirty       bool   `json:"dirty"`                   // uncommitted changes?
+	RemoteURL   string `json:"remote_url"`              // origin remote URL (sanitized, auto-detected)
+	TrackedRepo string `json:"tracked_repo,omitempty"`  // user-configured repository URL
+
+	// Tracked branch compliance (only populated when tracked_branch is configured)
+	TrackedBranch       string    `json:"tracked_branch,omitempty"`         // configured primary branch name
+	TrackedCommit       string    `json:"tracked_commit,omitempty"`         // latest commit on tracked branch
+	TrackedCommitShort  string    `json:"tracked_commit_short,omitempty"`
+	TrackedCommitAuthor string    `json:"tracked_commit_author,omitempty"`
+	TrackedCommitEmail  string    `json:"tracked_commit_email,omitempty"`
+	TrackedCommitMsg    string    `json:"tracked_commit_message,omitempty"`
+	TrackedCommitTime   time.Time `json:"tracked_commit_timestamp,omitempty"`
+	RepoMismatch        bool      `json:"repo_mismatch"`      // detected remote != configured tracked_repo
+	IsMerged            bool      `json:"is_merged"`          // is HEAD ancestor of tracked branch?
+	IsCurrentBranch     bool      `json:"is_current_branch"`  // current branch == tracked branch?
+	CommitsAhead        int       `json:"commits_ahead"`      // HEAD commits not in tracked
+	CommitsBehind       int       `json:"commits_behind"`     // tracked commits not in HEAD
 }
 
 // CloudIdentity represents the normalized identity of a cloud caller.
@@ -107,7 +135,6 @@ type CollectConfig struct {
 	OSUser        bool
 	Hostname      bool
 	HomeDir       bool
-	GitIdentity   bool
 	PublicIP      bool
 	CloudMetadata bool
 	HashHostname  bool
@@ -117,10 +144,9 @@ type CollectConfig struct {
 // DefaultCollectConfig returns default privacy settings.
 func DefaultCollectConfig() CollectConfig {
 	return CollectConfig{
-		OSUser:      true,
-		Hostname:    true,
-		HomeDir:     false,
-		GitIdentity: true,
+		OSUser:   true,
+		Hostname: true,
+		HomeDir:  false,
 	}
 }
 
@@ -152,6 +178,11 @@ type HostnameResolver interface {
 	Hostname() (string, error)
 }
 
+// StateReader reads Terraform state from a remote backend.
+type StateReader interface {
+	ReadState(ctx context.Context, cfg *BackendConfig) ([]byte, error)
+}
+
 // STSCaller calls AWS STS GetCallerIdentity.
 type STSCaller interface {
 	GetCallerIdentity(ctx context.Context) (*STSOutput, error)
@@ -174,10 +205,10 @@ type GitRepo interface {
 	HeadHash() (string, error)
 	HeadBranch() (branch string, detached bool, err error)
 	IsDirty() (bool, error)
-	HeadCommit() (*CommitInfo, error)
 	RemoteURL(name string) (string, error)
-	TagsAtHead() ([]string, error)
-	ConfigValue(section, subsection, key string) (string, error)
+	BranchCommit(branch string) (*CommitInfo, string, error)
+	IsAncestor(commitHash, branchRef string) (bool, error)
+	CommitCounts(refA, refB string) (ahead int, behind int, err error)
 	Close()
 }
 
@@ -223,14 +254,17 @@ func (osHostnameResolver) Hostname() (string, error) { return os.Hostname() }
 
 // Collector orchestrates all context collection with injectable dependencies.
 type Collector struct {
-	Config CollectConfig
-	Env    EnvReader
-	User   UserLookup
-	Cmd    CommandRunner
-	FS     FileReader
-	Host   HostnameResolver
-	GitOp  GitOpener
-	STS    STSCaller
+	Config        CollectConfig
+	Env           EnvReader
+	User          UserLookup
+	Cmd           CommandRunner
+	FS            FileReader
+	Host          HostnameResolver
+	GitOp         GitOpener
+	STS           STSCaller
+	StateR        StateReader
+	TrackedBranch string // user-configured primary branch to track for compliance
+	TrackedRepo   string // user-configured repository URL
 }
 
 // NewCollector creates a Collector with real OS dependencies.
@@ -242,6 +276,7 @@ func NewCollector(config CollectConfig) *Collector {
 		Cmd:    execCommandRunner{},
 		FS:     osFileReader{},
 		Host:   osHostnameResolver{},
+		StateR: NewMultiStateReader(),
 	}
 }
 
@@ -255,6 +290,7 @@ func (c *Collector) Collect(ctx context.Context) *CollectionResult {
 		Identity:    c.CollectLocalIdentity(ctx),
 		Git:         c.CollectGitContext(ctx),
 		Cloud:       c.CollectCloudIdentities(ctx),
+		State:       c.CollectStateMetadata(ctx),
 		CollectedAt: time.Now().UTC(),
 	}
 }

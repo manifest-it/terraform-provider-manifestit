@@ -20,6 +20,7 @@ type ObserverPayload struct {
 	Identity    any    `json:"identity"`
 	Git         any    `json:"git"`
 	Cloud       any    `json:"cloud,omitempty"`
+	State       any    `json:"state,omitempty"`
 	CollectedAt string `json:"collected_at"`
 	Action      string `json:"action"`           // "apply", "plan", "destroy"
 	ResourceID  string `json:"resource_id"`       // Terraform resource ID

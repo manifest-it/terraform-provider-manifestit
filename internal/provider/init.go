@@ -30,7 +30,6 @@ import (
 
 var (
 	_ provider.Provider = &Provider{}
-
 )
 
 type Provider struct {
@@ -49,6 +48,8 @@ type ProviderSchema struct {
 	OrgId                     types.String `tfsdk:"org_id"`
 	HttpClientRetryMaxRetries types.Int64  `tfsdk:"http_client_retry_max_retries"`
 	HttpClientRetryEnabled    types.String `tfsdk:"http_client_retry_enabled"`
+	TrackedBranch             types.String `tfsdk:"tracked_branch"`
+	TrackedRepo               types.String `tfsdk:"tracked_repo"`
 }
 
 func New() provider.Provider {
@@ -119,6 +120,20 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 		if err == nil {
 			v, _ := strconv.Atoi(rTimeout)
 			config.HttpClientRetryMaxRetries = types.Int64Value(int64(v))
+		}
+	}
+
+	if config.TrackedBranch.IsNull() {
+		tb, err := utils.GetMultiEnvVar(utils.MITTrackedBranch)
+		if err == nil {
+			config.TrackedBranch = types.StringValue(tb)
+		}
+	}
+
+	if config.TrackedRepo.IsNull() {
+		tr, err := utils.GetMultiEnvVar(utils.MITTrackedRepo)
+		if err == nil {
+			config.TrackedRepo = types.StringValue(tr)
 		}
 	}
 
@@ -201,6 +216,14 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 				Optional:    true,
 				Description: "The HTTP request maximum retry number. Defaults to 3.",
 			},
+			"tracked_branch": schema.StringAttribute{
+				Required:    true,
+				Description: "The primary branch to track for compliance (e.g., 'main'). The provider checks whether the current code has been merged to this branch.",
+			},
+			"tracked_repo": schema.StringAttribute{
+				Required:    true,
+				Description: "The Git repository URL to track (e.g., 'https://github.com/org/infra'). Used to identify which repository this Terraform workspace belongs to.",
+			},
 		},
 	}
 }
@@ -260,9 +283,11 @@ func alreadyPostedForParent() bool {
 func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) {
 	operation := detectTerraformOperation()
 
-	// Skip posting for plan-only operations
-	if operation == "plan" {
-		tflog.Debug(ctx, "skipping observer post during plan")
+	// Skip posting for plan and refresh operations.
+	// Plan is read-only; refresh only syncs drift and increments serial,
+	// which would confuse backend serial tracking.
+	if operation == "plan" || operation == "refresh" {
+		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
 		return
 	}
 
@@ -273,6 +298,12 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 	}
 
 	c := collectors.NewCollector(collectors.DefaultCollectConfig())
+	if !config.TrackedBranch.IsNull() {
+		c.TrackedBranch = config.TrackedBranch.ValueString()
+	}
+	if !config.TrackedRepo.IsNull() {
+		c.TrackedRepo = config.TrackedRepo.ValueString()
+	}
 	result := c.Collect(ctx)
 
 	orgID := ""
@@ -284,8 +315,9 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 		Identity:    result.Identity,
 		Git:         result.Git,
 		Cloud:       result.Cloud,
+		State:       result.State,
 		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
-		Action:      operation,
+		Action:      "operation",
 		ResourceID:  "",
 		OrgID:       orgID,
 	})

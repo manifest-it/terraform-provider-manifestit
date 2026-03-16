@@ -6,11 +6,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
@@ -63,27 +65,6 @@ func (r *goGitRepo) IsDirty() (bool, error) {
 	return !status.IsClean(), nil
 }
 
-func (r *goGitRepo) HeadCommit() (*CommitInfo, error) {
-	ref, err := r.repo.Head()
-	if err != nil {
-		return nil, err
-	}
-	commit, err := r.repo.CommitObject(ref.Hash())
-	if err != nil {
-		return nil, err
-	}
-	msg := commit.Message
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
-	return &CommitInfo{
-		Author:    commit.Author.Name,
-		Email:     commit.Author.Email,
-		Message:   msg,
-		Timestamp: commit.Author.When,
-	}, nil
-}
-
 func (r *goGitRepo) RemoteURL(name string) (string, error) {
 	remote, err := r.repo.Remote(name)
 	if err != nil {
@@ -96,50 +77,100 @@ func (r *goGitRepo) RemoteURL(name string) (string, error) {
 	return urls[0], nil
 }
 
-func (r *goGitRepo) TagsAtHead() ([]string, error) {
-	ref, err := r.repo.Head()
+func (r *goGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
+	// Try remote ref first, then local
+	ref, err := r.repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true)
 	if err != nil {
-		return nil, err
+		ref, err = r.repo.Reference(plumbing.NewBranchReferenceName(branch), true)
+		if err != nil {
+			return nil, "", fmt.Errorf("branch %s not found: %w", branch, err)
+		}
 	}
-	headHash := ref.Hash()
-
-	tagRefs, err := r.repo.Tags()
+	hash := ref.Hash().String()
+	commit, err := r.repo.CommitObject(ref.Hash())
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	msg := commit.Message
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return &CommitInfo{
+		Author:    commit.Author.Name,
+		Email:     commit.Author.Email,
+		Message:   msg,
+		Timestamp: commit.Author.When,
+	}, hash, nil
+}
+
+func (r *goGitRepo) IsAncestor(commitHash, branchRef string) (bool, error) {
+	commitObj, err := r.repo.CommitObject(plumbing.NewHash(commitHash))
+	if err != nil {
+		return false, err
+	}
+	ref, err := r.repo.Reference(plumbing.NewRemoteReferenceName("origin", branchRef), true)
+	if err != nil {
+		// Try local branch
+		ref, err = r.repo.Reference(plumbing.NewBranchReferenceName(branchRef), true)
+		if err != nil {
+			return false, err
+		}
+	}
+	branchCommit, err := r.repo.CommitObject(ref.Hash())
+	if err != nil {
+		return false, err
+	}
+	return commitObj.IsAncestor(branchCommit)
+}
+
+func (r *goGitRepo) CommitCounts(headHash, trackedHash string) (ahead int, behind int, err error) {
+	headCommit, err := r.repo.CommitObject(plumbing.NewHash(headHash))
+	if err != nil {
+		return 0, 0, err
+	}
+	trackedCommit, err := r.repo.CommitObject(plumbing.NewHash(trackedHash))
+	if err != nil {
+		return 0, 0, err
 	}
 
-	var result []string
-	_ = tagRefs.ForEach(func(ref *plumbing.Reference) error {
-		// Lightweight tags point directly at the commit
-		if ref.Hash() == headHash {
-			result = append(result, ref.Name().Short())
-			return nil
-		}
-		// Annotated tags: resolve the tag object to find the target commit
-		tagObj, err := r.repo.TagObject(ref.Hash())
-		if err == nil && tagObj.Target == headHash {
-			result = append(result, ref.Name().Short())
-		}
+	// Find merge base by collecting all ancestors
+	headAncestors := make(map[plumbing.Hash]bool)
+	trackedAncestors := make(map[plumbing.Hash]bool)
+
+	// Walk HEAD's history
+	iter, err := r.repo.Log(&git.LogOptions{From: headCommit.Hash})
+	if err != nil {
+		return 0, 0, err
+	}
+	_ = iter.ForEach(func(c *object.Commit) error {
+		headAncestors[c.Hash] = true
 		return nil
 	})
 
-	return result, nil
-}
-
-func (r *goGitRepo) ConfigValue(section, subsection, key string) (string, error) {
-	cfg, err := r.repo.Config()
+	// Walk tracked branch's history
+	iter, err = r.repo.Log(&git.LogOptions{From: trackedCommit.Hash})
 	if err != nil {
-		return "", err
+		return 0, 0, err
 	}
-	raw := cfg.Raw
-	if raw == nil {
-		return "", fmt.Errorf("no raw config")
+	_ = iter.ForEach(func(c *object.Commit) error {
+		trackedAncestors[c.Hash] = true
+		return nil
+	})
+
+	// Ahead = commits in HEAD not in tracked
+	for h := range headAncestors {
+		if !trackedAncestors[h] {
+			ahead++
+		}
 	}
-	sec := raw.Section(section)
-	if subsection != "" {
-		return sec.Subsection(subsection).Option(key), nil
+	// Behind = commits in tracked not in HEAD
+	for h := range trackedAncestors {
+		if !headAncestors[h] {
+			behind++
+		}
 	}
-	return sec.Option(key), nil
+
+	return ahead, behind, nil
 }
 
 func (r *goGitRepo) Close() {}
@@ -176,9 +207,6 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 
 	if hash, err := repo.HeadHash(); err == nil {
 		gc.Commit = hash
-		if len(hash) >= 7 {
-			gc.CommitShort = hash[:7]
-		}
 	}
 
 	if branch, detached, err := repo.HeadBranch(); err == nil {
@@ -193,27 +221,43 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 		gc.Dirty = dirty
 	}
 
-	if info, err := repo.HeadCommit(); err == nil {
-		gc.CommitAuthor = info.Author
-		gc.CommitEmail = info.Email
-		gc.CommitMessage = info.Message
-		gc.CommitTimestamp = info.Timestamp
-	}
-
-	if c.Config.GitIdentity {
-		gc.LocalGitName, _ = repo.ConfigValue("user", "", "name")
-		gc.LocalGitEmail, _ = repo.ConfigValue("user", "", "email")
-	}
-
 	if remoteURL, err := repo.RemoteURL("origin"); err == nil {
 		gc.RemoteURL = sanitizeRemoteURL(remoteURL)
 	}
 
-	if tags, err := repo.TagsAtHead(); err == nil {
-		gc.Tags = tags
+	gc.TrackedRepo = c.TrackedRepo
+
+	// Validate repo: skip compliance check if running from wrong repository
+	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
+		gc.RepoMismatch = true
+		return gc
 	}
 
-	gc.PRNumber = c.detectPRNumber()
+	// Tracked branch compliance check
+	if c.TrackedBranch != "" {
+		if info, hash, err := repo.BranchCommit(c.TrackedBranch); err == nil {
+			gc.TrackedBranch = c.TrackedBranch
+			gc.TrackedCommit = hash
+			if len(hash) >= 7 {
+				gc.TrackedCommitShort = hash[:7]
+			}
+			gc.TrackedCommitAuthor = info.Author
+			gc.TrackedCommitEmail = info.Email
+			gc.TrackedCommitMsg = info.Message
+			gc.TrackedCommitTime = info.Timestamp
+			gc.IsCurrentBranch = gc.Branch == c.TrackedBranch
+
+			if gc.Commit != "" {
+				if merged, err := repo.IsAncestor(gc.Commit, c.TrackedBranch); err == nil {
+					gc.IsMerged = merged
+				}
+				if ahead, behind, err := repo.CommitCounts(gc.Commit, hash); err == nil {
+					gc.CommitsAhead = ahead
+					gc.CommitsBehind = behind
+				}
+			}
+		}
+	}
 
 	return gc
 }
@@ -230,9 +274,6 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 	}
 
 	gc.Commit = run("rev-parse", "HEAD")
-	if len(gc.Commit) >= 7 {
-		gc.CommitShort = gc.Commit[:7]
-	}
 
 	branch := run("rev-parse", "--abbrev-ref", "HEAD")
 	if branch == "HEAD" {
@@ -242,35 +283,62 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 	}
 
 	gc.Dirty = run("status", "--porcelain") != ""
-	gc.CommitAuthor = run("log", "-1", "--format=%an")
-	gc.CommitEmail = run("log", "-1", "--format=%ae")
-
-	msg := run("log", "-1", "--format=%B")
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
-	gc.CommitMessage = msg
-
-	if ts := run("log", "-1", "--format=%aI"); ts != "" {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil {
-			gc.CommitTimestamp = t
-		}
-	}
-
-	if c.Config.GitIdentity {
-		gc.LocalGitName = run("config", "user.name")
-		gc.LocalGitEmail = run("config", "user.email")
-	}
 
 	if remoteURL := run("remote", "get-url", "origin"); remoteURL != "" {
 		gc.RemoteURL = sanitizeRemoteURL(remoteURL)
 	}
 
-	if tagOutput := run("tag", "--points-at", "HEAD"); tagOutput != "" {
-		gc.Tags = strings.Split(tagOutput, "\n")
+	gc.TrackedRepo = c.TrackedRepo
+
+	// Validate repo: skip compliance check if running from wrong repository
+	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
+		gc.RepoMismatch = true
+		return gc
 	}
 
-	gc.PRNumber = c.detectPRNumber()
+	// Tracked branch compliance check
+	if c.TrackedBranch != "" {
+		trackedRef := "refs/remotes/origin/" + c.TrackedBranch
+		hash := run("rev-parse", trackedRef)
+		if hash == "" {
+			trackedRef = "refs/heads/" + c.TrackedBranch
+			hash = run("rev-parse", trackedRef)
+		}
+		if hash != "" {
+			gc.TrackedBranch = c.TrackedBranch
+			gc.TrackedCommit = hash
+			if len(hash) >= 7 {
+				gc.TrackedCommitShort = hash[:7]
+			}
+			gc.IsCurrentBranch = gc.Branch == c.TrackedBranch
+
+			gc.TrackedCommitAuthor = run("log", "-1", "--format=%an", hash)
+			gc.TrackedCommitEmail = run("log", "-1", "--format=%ae", hash)
+			msg := run("log", "-1", "--format=%B", hash)
+			if len(msg) > 200 {
+				msg = msg[:200]
+			}
+			gc.TrackedCommitMsg = msg
+			if ts := run("log", "-1", "--format=%aI", hash); ts != "" {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					gc.TrackedCommitTime = t
+				}
+			}
+
+			// Ancestry check: is HEAD already in tracked branch?
+			_, mergeErr := c.Cmd.Run(ctx, dir, "git", "merge-base", "--is-ancestor", "HEAD", trackedRef)
+			gc.IsMerged = mergeErr == nil
+
+			// Divergence: ahead/behind counts
+			if counts := run("rev-list", "--left-right", "--count", "HEAD..."+trackedRef); counts != "" {
+				parts := strings.Fields(counts)
+				if len(parts) == 2 {
+					gc.CommitsAhead, _ = strconv.Atoi(parts[0])
+					gc.CommitsBehind, _ = strconv.Atoi(parts[1])
+				}
+			}
+		}
+	}
 
 	return gc
 }
@@ -303,35 +371,6 @@ func (c *Collector) resolveBranchFromCI() string {
 	return ""
 }
 
-// detectPRNumber extracts PR/MR number from CI environment variables.
-func (c *Collector) detectPRNumber() string {
-	prEnvVars := []string{
-		"CI_MERGE_REQUEST_IID",             // GitLab
-		"SYSTEM_PULLREQUEST_PULLREQUESTID", // Azure DevOps
-		"BITBUCKET_PR_ID",                  // Bitbucket
-		"ghprbPullId",                      // Jenkins GitHub PR Builder
-	}
-
-	for _, env := range prEnvVars {
-		if val := c.Env.Getenv(env); val != "" {
-			return val
-		}
-	}
-
-	// GitHub Actions: parse PR number from GITHUB_REF (refs/pull/123/merge)
-	if c.Env.Getenv("GITHUB_ACTIONS") == "true" {
-		ref := c.Env.Getenv("GITHUB_REF")
-		if strings.HasPrefix(ref, "refs/pull/") {
-			parts := strings.Split(ref, "/")
-			if len(parts) >= 3 {
-				return parts[2]
-			}
-		}
-	}
-
-	return ""
-}
-
 // findGitDir walks up from the working directory looking for .git.
 func findGitDir() (string, error) {
 	dir, err := os.Getwd()
@@ -352,6 +391,42 @@ func findGitDir() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// normalizeRepoURL normalizes a Git remote URL for comparison.
+// Handles HTTPS, SSH, and .git suffix variations so that:
+//   - https://github.com/org/repo.git
+//   - https://github.com/org/repo
+//   - git@github.com:org/repo.git
+//
+// all normalize to "github.com/org/repo".
+func normalizeRepoURL(rawURL string) string {
+	s := strings.TrimSpace(rawURL)
+	s = strings.TrimSuffix(s, ".git")
+
+	// SSH: git@github.com:org/repo → github.com/org/repo
+	if strings.Contains(s, "@") && !strings.Contains(s, "://") {
+		if idx := strings.Index(s, "@"); idx >= 0 {
+			s = s[idx+1:]
+		}
+		s = strings.Replace(s, ":", "/", 1)
+		return strings.ToLower(s)
+	}
+
+	// HTTPS: https://github.com/org/repo → github.com/org/repo
+	parsed, err := url.Parse(s)
+	if err != nil {
+		return strings.ToLower(s)
+	}
+	return strings.ToLower(strings.TrimPrefix(parsed.Host+parsed.Path, "/"))
+}
+
+// repoMatches checks if the detected git remote URL matches the user-configured tracked_repo.
+func repoMatches(detectedRemote, trackedRepo string) bool {
+	if detectedRemote == "" || trackedRepo == "" {
+		return false
+	}
+	return normalizeRepoURL(detectedRemote) == normalizeRepoURL(trackedRepo)
 }
 
 // sanitizeRemoteURL strips credentials from a Git remote URL.
