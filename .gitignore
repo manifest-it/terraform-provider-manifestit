@@ -12,3 +12,4 @@ your_temporal.db
 workflow_actions_new.go
 kube-deployment.yaml
 .claude
+bin
