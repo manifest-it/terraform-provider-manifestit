@@ -12,13 +12,16 @@ import (
 
 // Config holds everything needed to build the ManifestIT SDK clients.
 type Config struct {
-	APIKey     string
-	BaseURL    string
-	OrgID      string
-	HTTPClient *http.Client
-	Debug      bool
-	Logger     zerolog.Logger
-	MaxRetries int
+	APIKey                  string
+	BaseURL                 string
+	OrgID                   string
+	OrgKey                  string
+	ProviderID              string
+	ProviderConfigurationID string
+	HTTPClient              *http.Client
+	Debug                   bool
+	Logger                  zerolog.Logger
+	MaxRetries              int
 }
 
 // ProviderClient holds per-resource API clients.
@@ -49,10 +52,13 @@ func NewProviderClient(cfg Config) (*ProviderClient, error) {
 	})
 
 	api := sdk.NewAPIClient(sdk.APIClientConfig{
-		Executor: executor,
-		BaseURL:  cfg.BaseURL,
-		OrgID:    cfg.OrgID,
-		Logger:   cfg.Logger,
+		Executor:                executor,
+		BaseURL:                 cfg.BaseURL,
+		OrgID:                   cfg.OrgID,
+		OrgKey:                  cfg.OrgKey,
+		ProviderID:              cfg.ProviderID,
+		ProviderConfigurationID: cfg.ProviderConfigurationID,
+		Logger:                  cfg.Logger,
 	})
 
 	return &ProviderClient{

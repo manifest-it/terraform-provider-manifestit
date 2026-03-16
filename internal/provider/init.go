@@ -45,11 +45,14 @@ type ProviderSchema struct {
 	ApiKey                    types.String `tfsdk:"api_key"`
 	ApiUrl                    types.String `tfsdk:"api_url"`
 	Validate                  types.String `tfsdk:"validate"`
-	OrgId                     types.String `tfsdk:"org_id"`
+	OrgId                     types.Int32  `tfsdk:"org_id"`
 	HttpClientRetryMaxRetries types.Int64  `tfsdk:"http_client_retry_max_retries"`
 	HttpClientRetryEnabled    types.String `tfsdk:"http_client_retry_enabled"`
 	TrackedBranch             types.String `tfsdk:"tracked_branch"`
 	TrackedRepo               types.String `tfsdk:"tracked_repo"`
+	ProviderConfigurationId   types.Int32  `tfsdk:"provider_configuration_id"`
+	OrgKey                    types.String `tfsdk:"org_key"`
+	ProviderId                types.Int32  `tfsdk:"provider_id"`
 }
 
 func New() provider.Provider {
@@ -88,33 +91,23 @@ func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequ
 	// Collect and post observer data on every provider configuration.
 	// This fires on every terraform operation (plan, apply, destroy).
 	// Runs synchronously to ensure it completes before Terraform terminates the provider.
-	p.postObserverData(ctx, &config)
+	response.Diagnostics.Append(p.postObserverData(ctx, &config)...)
 }
 
 func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
+	// api_key: optional in schema, falls back to env, error if neither set
 	if config.ApiKey.IsNull() {
-		apiKey, err := utils.GetMultiEnvVar(utils.MITAPIKeyEnvName)
-		if err == nil {
-			config.ApiKey = types.StringValue(apiKey)
+		apiKey, err := utils.GetMultiEnvVar(utils.MITAPIKey)
+		if err != nil {
+			diags.AddError("Missing API Key", "api_key must be set in the provider block or via the MIT_API_KEY environment variable.")
+			return diags
 		}
+		config.ApiKey = types.StringValue(apiKey)
 	}
 
-	if config.ApiUrl.IsNull() {
-		apiUrl, err := utils.GetMultiEnvVar(utils.MITAPIUrlEnvName)
-		if err == nil {
-			config.ApiUrl = types.StringValue(apiUrl)
-		}
-	}
-
-	if config.OrgId.IsNull() {
-		orgUUID, err := utils.GetMultiEnvVar(utils.MITOrgIDEnvName)
-		if err == nil {
-			config.OrgId = types.StringValue(orgUUID)
-		}
-	}
-
+	// Retry settings: optional with env var fallbacks and defaults.
 	if config.HttpClientRetryMaxRetries.IsNull() {
 		rTimeout, err := utils.GetMultiEnvVar(utils.MITHTTPRetryMaxRetries)
 		if err == nil {
@@ -123,28 +116,15 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 		}
 	}
 
-	if config.TrackedBranch.IsNull() {
-		tb, err := utils.GetMultiEnvVar(utils.MITTrackedBranch)
-		if err == nil {
-			config.TrackedBranch = types.StringValue(tb)
-		}
-	}
-
-	if config.TrackedRepo.IsNull() {
-		tr, err := utils.GetMultiEnvVar(utils.MITTrackedRepo)
-		if err == nil {
-			config.TrackedRepo = types.StringValue(tr)
-		}
-	}
-
 	if config.HttpClientRetryEnabled.IsNull() {
-		config.HttpClientRetryEnabled = types.StringValue("true")
+		rEnabled, err := utils.GetMultiEnvVar(utils.MITHTTPRetryEnabled)
+		if err == nil {
+			config.HttpClientRetryEnabled = types.StringValue(rEnabled)
+		} else {
+			config.HttpClientRetryEnabled = types.StringValue("true")
+		}
 	}
-	if config.Validate.IsNull() {
-		config.Validate = types.StringValue("true")
-	}
-	// Run validations on the provider config after defaults and values from
-	// env var has been set.
+
 	diags.Append(p.ValidateConfigValues(ctx, config)...)
 
 	return diags
@@ -152,10 +132,10 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 
 func (p *Provider) ValidateConfigValues(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
 	var diags diag.Diagnostics
-	// Init validators we need for purposes of config validation only
 	oneOfStringValidator := stringvalidator.OneOf("true", "false")
 	int64BetweenValidator := int64validator.Between(1, 5)
 
+	// Validate boolean-style string fields
 	if !config.Validate.IsNull() {
 		res := validator.StringResponse{}
 		oneOfStringValidator.ValidateString(ctx, validator.StringRequest{ConfigValue: config.Validate}, &res)
@@ -191,30 +171,19 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 			"api_key": schema.StringAttribute{
 				Optional:    true,
 				Sensitive:   true,
-				Description: "(Required unless validate is false) ManifestIT API key. This can also be set via the MIT_API_KEY environment variable.",
+				Description: "ManifestIT API key. Can also be set via the MIT_API_KEY environment variable.",
 			},
 			"api_url": schema.StringAttribute{
-				Optional:    true,
-				Sensitive:   true,
-				Description: "The API URL. This can also be set via the MIT_HOST environment variable, and defaults to `https://api.manifestit.tech`",
+				Required:    true,
+				Description: "The ManifestIT API endpoint URL.",
 			},
 			"validate": schema.StringAttribute{
-				Optional:    true,
-				Sensitive:   true,
-				Description: "Enables validation of the provided API key during provider initialization. Valid values are [`true`, `false`]. Default is true. When false, api_key won't be checked.",
+				Required:    true,
+				Description: "Enables validation of the provided API key during provider initialization. Valid values are [`true`, `false`].",
 			},
-			"org_id": schema.StringAttribute{
-				Optional:    true,
-				Sensitive:   true,
-				Description: "The organization ID",
-			},
-			"http_client_retry_enabled": schema.StringAttribute{
-				Optional:    true,
-				Description: "Enables request retries on HTTP status codes 429 and 5xx. Valid values are [`true`, `false`]. Defaults to `true`.",
-			},
-			"http_client_retry_max_retries": schema.Int64Attribute{
-				Optional:    true,
-				Description: "The HTTP request maximum retry number. Defaults to 3.",
+			"org_id": schema.Int32Attribute{
+				Required:    true,
+				Description: "The organization ID.",
 			},
 			"tracked_branch": schema.StringAttribute{
 				Required:    true,
@@ -223,6 +192,27 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 			"tracked_repo": schema.StringAttribute{
 				Required:    true,
 				Description: "The Git repository URL to track (e.g., 'https://github.com/org/infra'). Used to identify which repository this Terraform workspace belongs to.",
+			},
+			"provider_configuration_id": schema.Int32Attribute{
+				Required:    true,
+				Description: "The provider configuration ID.",
+			},
+			"org_key": schema.StringAttribute{
+				Required:    true,
+				Sensitive:   true,
+				Description: "The organization key.",
+			},
+			"provider_id": schema.Int32Attribute{
+				Required:    true,
+				Description: "The provider ID.",
+			},
+			"http_client_retry_enabled": schema.StringAttribute{
+				Optional:    true,
+				Description: "Enables request retries on HTTP status codes 429 and 5xx. Valid values are [`true`, `false`]. Defaults to `true`.",
+			},
+			"http_client_retry_max_retries": schema.Int64Attribute{
+				Optional:    true,
+				Description: "The HTTP request maximum retry number. Defaults to 3.",
 			},
 		},
 	}
@@ -280,7 +270,8 @@ func alreadyPostedForParent() bool {
 
 // postObserverData collects local identity, git context, and cloud identity,
 // then posts them to the ManifestIT API. Skips posting during plan-only operations.
-func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) {
+func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+	var diags diag.Diagnostics
 	operation := detectTerraformOperation()
 
 	// Skip posting for plan and refresh operations.
@@ -288,13 +279,13 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 	// which would confuse backend serial tracking.
 	if operation == "plan" || operation == "refresh" {
 		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
-		return
+		return diags
 	}
 
 	// Terraform spawns separate provider processes for plan and apply phases.
 	// Deduplicate by checking a lock file keyed on the parent terraform PID.
 	if alreadyPostedForParent() {
-		return
+		return diags
 	}
 
 	c := collectors.NewCollector(collectors.DefaultCollectConfig())
@@ -308,7 +299,7 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 
 	orgID := ""
 	if !config.OrgId.IsNull() {
-		orgID = config.OrgId.ValueString()
+		orgID = strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
 	}
 
 	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
@@ -322,8 +313,9 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 		OrgID:       orgID,
 	})
 	if err != nil {
-		tflog.Warn(ctx, "failed to post observer data", map[string]interface{}{"error": err.Error()})
+		diags.AddWarning("ManifestIT observer post failed", err.Error())
 	}
+	return diags
 }
 
 func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics {
@@ -337,14 +329,27 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 		maxRetries = int(config.HttpClientRetryMaxRetries.ValueInt64())
 	}
 
+	providerConfigID := ""
+	if !config.ProviderConfigurationId.IsNull() {
+		providerConfigID = strconv.FormatInt(int64(config.ProviderConfigurationId.ValueInt32()), 10)
+	}
+
+	providerID := ""
+	if !config.ProviderId.IsNull() {
+		providerID = strconv.FormatInt(int64(config.ProviderId.ValueInt32()), 10)
+	}
+
 	client, err := providers.NewProviderClient(providers.Config{
-		APIKey:     config.ApiKey.ValueString(),
-		BaseURL:    config.ApiUrl.ValueString(),
-		OrgID:      config.OrgId.ValueString(),
-		HTTPClient: p.HttpClient,
-		Debug:      debug,
-		Logger:     logger,
-		MaxRetries: maxRetries,
+		APIKey:                  config.ApiKey.ValueString(),
+		BaseURL:                 config.ApiUrl.ValueString(),
+		OrgID:                   strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10),
+		OrgKey:                  config.OrgKey.ValueString(),
+		ProviderID:              providerID,
+		ProviderConfigurationID: providerConfigID,
+		HTTPClient:              p.HttpClient,
+		Debug:                   debug,
+		Logger:                  logger,
+		MaxRetries:              maxRetries,
 	})
 	if err != nil {
 		diags.AddError("Failed to configure ManifestIT client", err.Error())
