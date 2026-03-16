@@ -22,8 +22,8 @@ type ObserverPayload struct {
 	Cloud       any    `json:"cloud,omitempty"`
 	State       any    `json:"state,omitempty"`
 	CollectedAt string `json:"collected_at"`
-	Action      string `json:"action"`           // "apply", "plan", "destroy"
-	ResourceID  string `json:"resource_id"`       // Terraform resource ID
+	Action      string `json:"action"`      // "apply", "plan", "destroy"
+	ResourceID  string `json:"resource_id"` // Terraform resource ID
 	OrgID       string `json:"org_id,omitempty"`
 }
 
@@ -33,7 +33,7 @@ type ObserverResponse struct {
 	Status string `json:"status"`
 }
 
-const basePath = "/api/v1/observer"
+const basePath = "/api/v1/events"
 
 // client implements Client using the SDK's APIClient.
 type client struct {
@@ -55,8 +55,10 @@ func (c *client) Post(ctx context.Context, input ObserverPayload) (*ObserverResp
 	}
 
 	var result ObserverResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse observer response: %w", err)
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("failed to parse observer response: %w", err)
+		}
 	}
 	return &result, nil
 }

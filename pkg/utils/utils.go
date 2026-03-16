@@ -132,32 +132,11 @@ func GetMultiEnvVar(envVars ...string) (string, error) {
 	return "", fmt.Errorf("unable to retrieve any env vars from list: %v", envVars)
 }
 
-// MITAPIKeyEnvName name of env var for API key
-const MITAPIKeyEnvName = "Mit-Api-Key"
-
-// MITAPIUrlEnvName name of env var for API key
-const MITAPIUrlEnvName = "MIT_HOST"
-
-// MITOrgIDEnvName name of env var for Org ID
-const MITOrgIDEnvName = "Mit-Org-ID"
+// MITAPIKey name of env var for API key
+const MITAPIKey = "MIT_API_KEY"
 
 // MITHTTPRetryEnabled name of env var for retry enabled
 const MITHTTPRetryEnabled = "MIT_HTTP_CLIENT_RETRY_ENABLED"
 
-// MITHTTPRetryTimeout name of env var for retry timeout
-const MITHTTPRetryTimeout = "MIT_HTTP_CLIENT_RETRY_TIMEOUT"
-
-// MITHTTPRetryBackoffMultiplier name of env var for retry backoff multiplier
-const MITHTTPRetryBackoffMultiplier = "MIT_HTTP_CLIENT_RETRY_BACKOFF_MULTIPLIER"
-
-// MITHTTPRetryBackoffBase name of env var for retry backoff base
-const MITHTTPRetryBackoffBase = "MIT_HTTP_CLIENT_RETRY_BACKOFF_BASE"
-
 // MITHTTPRetryMaxRetries name of env var for max retries
 const MITHTTPRetryMaxRetries = "MIT_HTTP_CLIENT_RETRY_MAX_RETRIES"
-
-// MITTrackedBranch name of env var for tracked branch
-const MITTrackedBranch = "MIT_TRACKED_BRANCH"
-
-// MITTrackedRepo name of env var for tracked repository URL
-const MITTrackedRepo = "MIT_TRACKED_REPO"
