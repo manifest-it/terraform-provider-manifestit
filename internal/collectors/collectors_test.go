@@ -49,30 +49,40 @@ func (m *mockCommandRunner) Run(_ context.Context, _ string, name string, args .
 }
 
 type mockGitRepo struct {
-	hash     string
-	branch   string
-	detached bool
-	dirty    bool
-	commit   *CommitInfo
-	remote   string
-	tags     []string
-	config   map[string]string // "section//key" → value
+	hash          string
+	branch        string
+	detached      bool
+	dirty         bool
+	remote        string
+	branchCommits map[string]struct { // keyed by branch name
+		info *CommitInfo
+		hash string
+	}
+	isAncestorResult bool
+	commitsAhead     int
+	commitsBehind    int
 }
 
-func (m *mockGitRepo) HeadHash() (string, error)   { return m.hash, nil }
+func (m *mockGitRepo) HeadHash() (string, error) { return m.hash, nil }
 func (m *mockGitRepo) HeadBranch() (string, bool, error) {
 	if m.detached {
 		return "HEAD", true, nil
 	}
 	return m.branch, false, nil
 }
-func (m *mockGitRepo) IsDirty() (bool, error)                  { return m.dirty, nil }
-func (m *mockGitRepo) HeadCommit() (*CommitInfo, error)         { return m.commit, nil }
-func (m *mockGitRepo) RemoteURL(_ string) (string, error)       { return m.remote, nil }
-func (m *mockGitRepo) TagsAtHead() ([]string, error)            { return m.tags, nil }
-func (m *mockGitRepo) ConfigValue(section, sub, key string) (string, error) {
-	k := section + "/" + sub + "/" + key
-	return m.config[k], nil
+func (m *mockGitRepo) IsDirty() (bool, error)            { return m.dirty, nil }
+func (m *mockGitRepo) RemoteURL(_ string) (string, error) { return m.remote, nil }
+func (m *mockGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
+	if bc, ok := m.branchCommits[branch]; ok {
+		return bc.info, bc.hash, nil
+	}
+	return nil, "", fmt.Errorf("branch %s not found", branch)
+}
+func (m *mockGitRepo) IsAncestor(_, _ string) (bool, error) {
+	return m.isAncestorResult, nil
+}
+func (m *mockGitRepo) CommitCounts(_, _ string) (int, int, error) {
+	return m.commitsAhead, m.commitsBehind, nil
 }
 func (m *mockGitRepo) Close() {}
 
@@ -268,28 +278,16 @@ func TestDetectCI_AllProviders(t *testing.T) {
 }
 
 func TestCollectGitFromRepo(t *testing.T) {
-	ts := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
 	repo := &mockGitRepo{
 		hash:     "abc1234567890def",
 		branch:   "main",
 		detached: false,
 		dirty:    true,
-		commit: &CommitInfo{
-			Author:    "Test Author",
-			Email:     "test@example.com",
-			Message:   "fix: resolve issue",
-			Timestamp: ts,
-		},
-		remote: "https://github.com/org/repo.git",
-		tags:   []string{"v1.0.0"},
-		config: map[string]string{
-			"user//name":  "Local User",
-			"user//email": "local@example.com",
-		},
+		remote:   "https://github.com/org/repo.git",
 	}
 
 	c := &Collector{
-		Config: CollectConfig{GitIdentity: true},
+		Config: CollectConfig{},
 		Env:    &mockEnvReader{vars: map[string]string{}},
 	}
 
@@ -301,26 +299,14 @@ func TestCollectGitFromRepo(t *testing.T) {
 	if gc.Commit != "abc1234567890def" {
 		t.Errorf("expected full hash, got %q", gc.Commit)
 	}
-	if gc.CommitShort != "abc1234" {
-		t.Errorf("expected short hash 'abc1234', got %q", gc.CommitShort)
-	}
 	if gc.Branch != "main" {
 		t.Errorf("expected branch 'main', got %q", gc.Branch)
 	}
 	if !gc.Dirty {
 		t.Error("expected dirty=true")
 	}
-	if gc.CommitAuthor != "Test Author" {
-		t.Errorf("expected author 'Test Author', got %q", gc.CommitAuthor)
-	}
 	if gc.RemoteURL != "https://github.com/org/repo.git" {
 		t.Errorf("expected clean remote URL, got %q", gc.RemoteURL)
-	}
-	if gc.LocalGitName != "Local User" {
-		t.Errorf("expected local git name 'Local User', got %q", gc.LocalGitName)
-	}
-	if len(gc.Tags) != 1 || gc.Tags[0] != "v1.0.0" {
-		t.Errorf("expected tags [v1.0.0], got %v", gc.Tags)
 	}
 }
 
@@ -328,8 +314,6 @@ func TestCollectGitFromRepo_DetachedHead_ResolvesFromCI(t *testing.T) {
 	repo := &mockGitRepo{
 		hash:     "abc1234567890def",
 		detached: true,
-		commit:   &CommitInfo{},
-		config:   map[string]string{},
 	}
 
 	c := &Collector{
@@ -371,39 +355,234 @@ func TestSanitizeRemoteURL(t *testing.T) {
 	}
 }
 
-func TestDetectPRNumber(t *testing.T) {
+func TestCollectGitFromRepo_TrackedBranch_OnMain(t *testing.T) {
+	ts := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	repo := &mockGitRepo{
+		hash:   "abc1234567890def",
+		branch: "main",
+		remote: "https://github.com/org/repo.git",
+		branchCommits: map[string]struct {
+			info *CommitInfo
+			hash string
+		}{
+			"main": {
+				info: &CommitInfo{
+					Author:    "Jane Doe",
+					Email:     "jane@example.com",
+					Message:   "Merge PR #42",
+					Timestamp: ts,
+				},
+				hash: "abc1234567890def",
+			},
+		},
+		isAncestorResult: true,
+		commitsAhead:     0,
+		commitsBehind:    0,
+	}
+
+	c := &Collector{
+		Config:        CollectConfig{},
+		Env:           &mockEnvReader{vars: map[string]string{}},
+		TrackedBranch: "main",
+	}
+
+	gc := c.collectGitFromRepo(context.Background(), repo)
+
+	if gc.TrackedBranch != "main" {
+		t.Errorf("expected tracked_branch 'main', got %q", gc.TrackedBranch)
+	}
+	if !gc.IsMerged {
+		t.Error("expected is_merged=true when on main")
+	}
+	if !gc.IsCurrentBranch {
+		t.Error("expected is_current_branch=true when on main")
+	}
+	if gc.CommitsAhead != 0 {
+		t.Errorf("expected commits_ahead=0, got %d", gc.CommitsAhead)
+	}
+	if gc.TrackedCommitAuthor != "Jane Doe" {
+		t.Errorf("expected tracked author 'Jane Doe', got %q", gc.TrackedCommitAuthor)
+	}
+}
+
+func TestCollectGitFromRepo_TrackedBranch_FeatureBranch(t *testing.T) {
+	ts := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	repo := &mockGitRepo{
+		hash:   "fff9999888877766",
+		branch: "feat-xyz",
+		remote: "https://github.com/org/repo.git",
+		branchCommits: map[string]struct {
+			info *CommitInfo
+			hash string
+		}{
+			"main": {
+				info: &CommitInfo{
+					Author:    "Jane Doe",
+					Email:     "jane@example.com",
+					Message:   "Merge PR #42",
+					Timestamp: ts,
+				},
+				hash: "abc1234567890def",
+			},
+		},
+		isAncestorResult: false,
+		commitsAhead:     3,
+		commitsBehind:    0,
+	}
+
+	c := &Collector{
+		Config:        CollectConfig{},
+		Env:           &mockEnvReader{vars: map[string]string{}},
+		TrackedBranch: "main",
+	}
+
+	gc := c.collectGitFromRepo(context.Background(), repo)
+
+	if gc.IsMerged {
+		t.Error("expected is_merged=false on feature branch")
+	}
+	if gc.IsCurrentBranch {
+		t.Error("expected is_current_branch=false on feature branch")
+	}
+	if gc.CommitsAhead != 3 {
+		t.Errorf("expected commits_ahead=3, got %d", gc.CommitsAhead)
+	}
+	if gc.TrackedCommit != "abc1234567890def" {
+		t.Errorf("expected tracked commit hash, got %q", gc.TrackedCommit)
+	}
+}
+
+func TestCollectGitFromRepo_NoTrackedBranch(t *testing.T) {
+	repo := &mockGitRepo{
+		hash:   "abc1234567890def",
+		branch: "main",
+		remote: "https://github.com/org/repo.git",
+	}
+
+	c := &Collector{
+		Config: CollectConfig{},
+		Env:    &mockEnvReader{vars: map[string]string{}},
+		// TrackedBranch not set
+	}
+
+	gc := c.collectGitFromRepo(context.Background(), repo)
+
+	if gc.TrackedBranch != "" {
+		t.Errorf("expected empty tracked_branch when not configured, got %q", gc.TrackedBranch)
+	}
+	if gc.IsMerged {
+		t.Error("expected is_merged=false when tracked branch not configured")
+	}
+}
+
+func TestCollectGitFromRepo_RepoMismatch(t *testing.T) {
+	ts := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	repo := &mockGitRepo{
+		hash:   "abc1234567890def",
+		branch: "main",
+		remote: "https://github.com/org/other-repo.git", // different repo
+		branchCommits: map[string]struct {
+			info *CommitInfo
+			hash string
+		}{
+			"main": {
+				info: &CommitInfo{
+					Author:    "Jane Doe",
+					Email:     "jane@example.com",
+					Message:   "Merge PR #42",
+					Timestamp: ts,
+				},
+				hash: "abc1234567890def",
+			},
+		},
+		isAncestorResult: true,
+		commitsAhead:     0,
+		commitsBehind:    0,
+	}
+
+	c := &Collector{
+		Config:        CollectConfig{},
+		Env:           &mockEnvReader{vars: map[string]string{}},
+		TrackedBranch: "main",
+		TrackedRepo:   "https://github.com/org/infra",
+	}
+
+	gc := c.collectGitFromRepo(context.Background(), repo)
+
+	if !gc.RepoMismatch {
+		t.Error("expected repo_mismatch=true when remote doesn't match tracked_repo")
+	}
+	if gc.TrackedBranch != "" {
+		t.Errorf("expected empty tracked_branch on repo mismatch, got %q", gc.TrackedBranch)
+	}
+	if gc.IsMerged {
+		t.Error("expected is_merged=false on repo mismatch")
+	}
+}
+
+func TestCollectGitFromRepo_RepoMatch(t *testing.T) {
+	ts := time.Date(2025, 1, 15, 10, 30, 0, 0, time.UTC)
+	repo := &mockGitRepo{
+		hash:   "abc1234567890def",
+		branch: "main",
+		remote: "git@github.com:org/infra.git", // SSH variant of tracked_repo
+		branchCommits: map[string]struct {
+			info *CommitInfo
+			hash string
+		}{
+			"main": {
+				info: &CommitInfo{
+					Author:    "Jane Doe",
+					Email:     "jane@example.com",
+					Message:   "Merge PR #42",
+					Timestamp: ts,
+				},
+				hash: "abc1234567890def",
+			},
+		},
+		isAncestorResult: true,
+		commitsAhead:     0,
+		commitsBehind:    0,
+	}
+
+	c := &Collector{
+		Config:        CollectConfig{},
+		Env:           &mockEnvReader{vars: map[string]string{}},
+		TrackedBranch: "main",
+		TrackedRepo:   "https://github.com/org/infra",
+	}
+
+	gc := c.collectGitFromRepo(context.Background(), repo)
+
+	if gc.RepoMismatch {
+		t.Error("expected repo_mismatch=false when SSH remote matches HTTPS tracked_repo")
+	}
+	if gc.TrackedBranch != "main" {
+		t.Errorf("expected tracked_branch 'main', got %q", gc.TrackedBranch)
+	}
+	if !gc.IsMerged {
+		t.Error("expected is_merged=true")
+	}
+}
+
+func TestNormalizeRepoURL(t *testing.T) {
 	tests := []struct {
-		name     string
-		env      map[string]string
+		input    string
 		expected string
 	}{
-		{
-			"github-actions-pr",
-			map[string]string{
-				"GITHUB_ACTIONS": "true",
-				"GITHUB_REF":    "refs/pull/42/merge",
-			},
-			"42",
-		},
-		{
-			"gitlab-mr",
-			map[string]string{"CI_MERGE_REQUEST_IID": "99"},
-			"99",
-		},
-		{
-			"no-pr",
-			map[string]string{},
-			"",
-		},
+		{"https://github.com/org/repo", "github.com/org/repo"},
+		{"https://github.com/org/repo.git", "github.com/org/repo"},
+		{"git@github.com:org/repo.git", "github.com/org/repo"},
+		{"git@github.com:org/repo", "github.com/org/repo"},
+		{"https://token@github.com/org/repo.git", "github.com/org/repo"},
+		{"https://github.com/Org/Repo", "github.com/org/repo"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := &Collector{Env: &mockEnvReader{vars: tt.env}}
-			if got := c.detectPRNumber(); got != tt.expected {
-				t.Errorf("detectPRNumber() = %q, want %q", got, tt.expected)
-			}
-		})
+		got := normalizeRepoURL(tt.input)
+		if got != tt.expected {
+			t.Errorf("normalizeRepoURL(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
 	}
 }
 

@@ -2,11 +2,16 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
+	"terraform-provider-manifestit/internal/collectors"
 	resource2 "terraform-provider-manifestit/internal/resource"
 	"terraform-provider-manifestit/pkg/sdk/providers"
+	"terraform-provider-manifestit/pkg/sdk/providers/observer"
 	"terraform-provider-manifestit/pkg/utils"
 	"time"
 
@@ -19,10 +24,13 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/rs/zerolog"
 )
 
-var _ provider.Provider = &Provider{}
+var (
+	_ provider.Provider = &Provider{}
+)
 
 type Provider struct {
 	HttpClient *http.Client
@@ -40,6 +48,8 @@ type ProviderSchema struct {
 	OrgId                     types.String `tfsdk:"org_id"`
 	HttpClientRetryMaxRetries types.Int64  `tfsdk:"http_client_retry_max_retries"`
 	HttpClientRetryEnabled    types.String `tfsdk:"http_client_retry_enabled"`
+	TrackedBranch             types.String `tfsdk:"tracked_branch"`
+	TrackedRepo               types.String `tfsdk:"tracked_repo"`
 }
 
 func New() provider.Provider {
@@ -74,6 +84,11 @@ func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequ
 	// Pass the SDK client (not the provider) to avoid import cycles
 	response.DataSourceData = p.Client
 	response.ResourceData = p.Client
+
+	// Collect and post observer data on every provider configuration.
+	// This fires on every terraform operation (plan, apply, destroy).
+	// Runs synchronously to ensure it completes before Terraform terminates the provider.
+	p.postObserverData(ctx, &config)
 }
 
 func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
@@ -105,6 +120,20 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 		if err == nil {
 			v, _ := strconv.Atoi(rTimeout)
 			config.HttpClientRetryMaxRetries = types.Int64Value(int64(v))
+		}
+	}
+
+	if config.TrackedBranch.IsNull() {
+		tb, err := utils.GetMultiEnvVar(utils.MITTrackedBranch)
+		if err == nil {
+			config.TrackedBranch = types.StringValue(tb)
+		}
+	}
+
+	if config.TrackedRepo.IsNull() {
+		tr, err := utils.GetMultiEnvVar(utils.MITTrackedRepo)
+		if err == nil {
+			config.TrackedRepo = types.StringValue(tr)
 		}
 	}
 
@@ -187,7 +216,113 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 				Optional:    true,
 				Description: "The HTTP request maximum retry number. Defaults to 3.",
 			},
+			"tracked_branch": schema.StringAttribute{
+				Required:    true,
+				Description: "The primary branch to track for compliance (e.g., 'main'). The provider checks whether the current code has been merged to this branch.",
+			},
+			"tracked_repo": schema.StringAttribute{
+				Required:    true,
+				Description: "The Git repository URL to track (e.g., 'https://github.com/org/infra'). Used to identify which repository this Terraform workspace belongs to.",
+			},
 		},
+	}
+}
+
+// detectTerraformOperation inspects the parent process command line to determine
+// the current Terraform operation (plan, apply, destroy, etc.).
+// The provider runs as a child process of terraform, so the parent's command
+// line reveals which subcommand was invoked.
+func detectTerraformOperation() string {
+	// Debug mode: provider runs standalone via go run / binary + TF_REATTACH_PROVIDERS.
+	// Parent is shell/IDE, so default to "apply" to ensure posting.
+	if os.Getenv("TF_REATTACH_PROVIDERS") != "" {
+		return "apply"
+	}
+
+	ppid := os.Getppid()
+	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(ppid)).Output()
+	if err != nil {
+		// ps failed, can't determine operation
+		return "unknown"
+	}
+
+	cmdLine := strings.TrimSpace(string(out))
+
+	// Check for known terraform subcommands in order of specificity.
+	// "apply" must be checked before "plan" since "terraform apply" also
+	// runs a plan phase internally.
+	for _, op := range []string{"apply", "destroy", "import", "refresh", "plan"} {
+		if strings.Contains(cmdLine, op) {
+			return op
+		}
+	}
+	return "unknown"
+}
+
+// alreadyPostedForParent checks if we've already posted for the current parent
+// terraform process. Uses a temp file keyed on the parent PID to deduplicate
+// across separate provider process invocations within the same terraform command.
+func alreadyPostedForParent() bool {
+	ppid := os.Getppid()
+	lockFile := fmt.Sprintf("/tmp/manifestit-observer-%d.lock", ppid)
+
+	// Check if lock file exists and is recent (within last 30 seconds)
+	if info, err := os.Stat(lockFile); err == nil {
+		if time.Since(info.ModTime()) < 30*time.Second {
+			return true
+		}
+	}
+
+	// Create/update the lock file
+	_ = os.WriteFile(lockFile, []byte(strconv.Itoa(ppid)), 0644)
+	return false
+}
+
+// postObserverData collects local identity, git context, and cloud identity,
+// then posts them to the ManifestIT API. Skips posting during plan-only operations.
+func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) {
+	operation := detectTerraformOperation()
+
+	// Skip posting for plan and refresh operations.
+	// Plan is read-only; refresh only syncs drift and increments serial,
+	// which would confuse backend serial tracking.
+	if operation == "plan" || operation == "refresh" {
+		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
+		return
+	}
+
+	// Terraform spawns separate provider processes for plan and apply phases.
+	// Deduplicate by checking a lock file keyed on the parent terraform PID.
+	if alreadyPostedForParent() {
+		return
+	}
+
+	c := collectors.NewCollector(collectors.DefaultCollectConfig())
+	if !config.TrackedBranch.IsNull() {
+		c.TrackedBranch = config.TrackedBranch.ValueString()
+	}
+	if !config.TrackedRepo.IsNull() {
+		c.TrackedRepo = config.TrackedRepo.ValueString()
+	}
+	result := c.Collect(ctx)
+
+	orgID := ""
+	if !config.OrgId.IsNull() {
+		orgID = config.OrgId.ValueString()
+	}
+
+	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
+		Identity:    result.Identity,
+		Git:         result.Git,
+		Cloud:       result.Cloud,
+		State:       result.State,
+		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
+		Action:      "operation",
+		ResourceID:  "",
+		OrgID:       orgID,
+	})
+	if err != nil {
+		tflog.Warn(ctx, "failed to post observer data", map[string]interface{}{"error": err.Error()})
 	}
 }
 
