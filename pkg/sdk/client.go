@@ -14,20 +14,26 @@ import (
 // APIClient provides convenience methods on top of HTTPExecutor for JSON REST APIs.
 // Resource-specific clients hold a reference to this for making HTTP calls.
 type APIClient struct {
-	Executor  *HTTPExecutor
-	BaseURL   string
-	OrgID     string
-	UserAgent string
-	Logger    zerolog.Logger
+	Executor                *HTTPExecutor
+	BaseURL                 string
+	OrgID                   string
+	OrgKey                  string
+	ProviderID              string
+	ProviderConfigurationID string
+	UserAgent               string
+	Logger                  zerolog.Logger
 }
 
 // APIClientConfig holds configuration for building an APIClient.
 type APIClientConfig struct {
-	Executor  *HTTPExecutor
-	BaseURL   string
-	OrgID     string
-	UserAgent string
-	Logger    zerolog.Logger
+	Executor                *HTTPExecutor
+	BaseURL                 string
+	OrgID                   string
+	OrgKey                  string
+	ProviderID              string
+	ProviderConfigurationID string
+	UserAgent               string
+	Logger                  zerolog.Logger
 }
 
 // NewAPIClient creates a new APIClient.
@@ -36,11 +42,14 @@ func NewAPIClient(cfg APIClientConfig) *APIClient {
 		cfg.UserAgent = "terraform-provider-manifestit/1.0"
 	}
 	return &APIClient{
-		Executor:  cfg.Executor,
-		BaseURL:   strings.TrimRight(cfg.BaseURL, "/"),
-		OrgID:     cfg.OrgID,
-		UserAgent: cfg.UserAgent,
-		Logger:    cfg.Logger,
+		Executor:                cfg.Executor,
+		BaseURL:                 strings.TrimRight(cfg.BaseURL, "/"),
+		OrgID:                   cfg.OrgID,
+		OrgKey:                  cfg.OrgKey,
+		ProviderID:              cfg.ProviderID,
+		ProviderConfigurationID: cfg.ProviderConfigurationID,
+		UserAgent:               cfg.UserAgent,
+		Logger:                  cfg.Logger,
 	}
 }
 
@@ -119,7 +128,17 @@ func (c *APIClient) newRequest(ctx context.Context, method, path string, body an
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.OrgID != "" {
-		req.Header.Set("X-Org-Id", c.OrgID)
+		req.Header.Set("Mit-Org-ID", c.OrgID)
+	}
+	if c.OrgKey != "" {
+		req.Header.Set("Mit-Org-Key", c.OrgKey)
+	}
+	if c.ProviderID != "" {
+		req.Header.Set("Mit-Provider-ID", c.ProviderID)
+		req.Header.Set("X-Provider", "terraform")
+	}
+	if c.ProviderConfigurationID != "" {
+		req.Header.Set("Mit-Provider-Config-ID", c.ProviderConfigurationID)
 	}
 
 	return req, nil
