@@ -12,7 +12,7 @@ import (
 // CollectionResult holds all collected context from a Terraform run.
 type CollectionResult struct {
 	Identity    LocalIdentity   `json:"identity"`
-	Git         GitContext       `json:"git"`
+	Git         GitContext      `json:"git"`
 	Cloud       []CloudIdentity `json:"cloud,omitempty"`
 	State       StateMetadata   `json:"state"`
 	CollectedAt time.Time       `json:"collected_at"`
@@ -29,13 +29,13 @@ type StateMetadata struct {
 
 // BackendConfig describes the Terraform backend used to store state.
 type BackendConfig struct {
-	Type               string `json:"type"`                             // "s3", "azurerm", "gcs", "local"
-	Bucket             string `json:"bucket,omitempty"`                 // S3 / GCS bucket name
-	Key                string `json:"key,omitempty"`                    // S3 object key / Azure blob name
-	Region             string `json:"region,omitempty"`                 // S3 region
-	StorageAccountName string `json:"storage_account_name,omitempty"`   // Azure storage account
-	ContainerName      string `json:"container_name,omitempty"`         // Azure blob container
-	Prefix             string `json:"prefix,omitempty"`                 // GCS prefix
+	Type               string `json:"type"`                           // "s3", "azurerm", "gcs", "local"
+	Bucket             string `json:"bucket,omitempty"`               // S3 / GCS bucket name
+	Key                string `json:"key,omitempty"`                  // S3 object key / Azure blob name
+	Region             string `json:"region,omitempty"`               // S3 region
+	StorageAccountName string `json:"storage_account_name,omitempty"` // Azure storage account
+	ContainerName      string `json:"container_name,omitempty"`       // Azure blob container
+	Prefix             string `json:"prefix,omitempty"`               // GCS prefix
 }
 
 // LocalIdentity identifies the human or system account initiating the Terraform run.
@@ -66,25 +66,25 @@ type LocalIdentity struct {
 // Minimal HEAD info + tracked branch compliance data.
 type GitContext struct {
 	Available   bool   `json:"available"`
-	Commit      string `json:"commit"`                  // HEAD commit hash
-	Branch      string `json:"branch"`                  // current branch name
-	Dirty       bool   `json:"dirty"`                   // uncommitted changes?
-	RemoteURL   string `json:"remote_url"`              // origin remote URL (sanitized, auto-detected)
-	TrackedRepo string `json:"tracked_repo,omitempty"`  // user-configured repository URL
+	Commit      string `json:"commit"`                 // HEAD commit hash
+	Branch      string `json:"branch"`                 // current branch name
+	Dirty       bool   `json:"dirty"`                  // uncommitted changes?
+	RemoteURL   string `json:"remote_url"`             // origin remote URL (sanitized, auto-detected)
+	TrackedRepo string `json:"tracked_repo,omitempty"` // user-configured repository URL
 
 	// Tracked branch compliance (only populated when tracked_branch is configured)
-	TrackedBranch       string    `json:"tracked_branch,omitempty"`         // configured primary branch name
-	TrackedCommit       string    `json:"tracked_commit,omitempty"`         // latest commit on tracked branch
+	TrackedBranch       string    `json:"tracked_branch,omitempty"` // configured primary branch name
+	TrackedCommit       string    `json:"tracked_commit,omitempty"` // latest commit on tracked branch
 	TrackedCommitShort  string    `json:"tracked_commit_short,omitempty"`
 	TrackedCommitAuthor string    `json:"tracked_commit_author,omitempty"`
 	TrackedCommitEmail  string    `json:"tracked_commit_email,omitempty"`
 	TrackedCommitMsg    string    `json:"tracked_commit_message,omitempty"`
 	TrackedCommitTime   time.Time `json:"tracked_commit_timestamp,omitempty"`
-	RepoMismatch        bool      `json:"repo_mismatch"`      // detected remote != configured tracked_repo
-	IsMerged            bool      `json:"is_merged"`          // is HEAD ancestor of tracked branch?
-	IsCurrentBranch     bool      `json:"is_current_branch"`  // current branch == tracked branch?
-	CommitsAhead        int       `json:"commits_ahead"`      // HEAD commits not in tracked
-	CommitsBehind       int       `json:"commits_behind"`     // tracked commits not in HEAD
+	RepoMismatch        bool      `json:"repo_mismatch"`     // detected remote != configured tracked_repo
+	IsMerged            bool      `json:"is_merged"`         // is HEAD ancestor of tracked branch?
+	IsCurrentBranch     bool      `json:"is_current_branch"` // current branch == tracked branch?
+	CommitsAhead        int       `json:"commits_ahead"`     // HEAD commits not in tracked
+	CommitsBehind       int       `json:"commits_behind"`    // tracked commits not in HEAD
 }
 
 // CloudIdentity represents the normalized identity of a cloud caller.
@@ -243,7 +243,7 @@ func (execCommandRunner) Run(ctx context.Context, dir, name string, args ...stri
 
 type osFileReader struct{}
 
-func (osFileReader) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+func (osFileReader) ReadFile(path string) ([]byte, error)  { return os.ReadFile(path) }
 func (osFileReader) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 type osHostnameResolver struct{}
@@ -263,8 +263,8 @@ type Collector struct {
 	GitOp         GitOpener
 	STS           STSCaller
 	StateR        StateReader
-	TrackedBranch string // user-configured primary branch to track for compliance
-	TrackedRepo   string // user-configured repository URL
+	TrackedBranch string
+	TrackedRepo   string
 }
 
 // NewCollector creates a Collector with real OS dependencies.
