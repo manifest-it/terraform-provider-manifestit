@@ -11,31 +11,9 @@ import (
 
 // CollectionResult holds all collected context from a Terraform run.
 type CollectionResult struct {
-	Identity    LocalIdentity   `json:"identity"`
-	Git         GitContext      `json:"git"`
-	Cloud       []CloudIdentity `json:"cloud,omitempty"`
-	State       StateMetadata   `json:"state"`
-	CollectedAt time.Time       `json:"collected_at"`
-}
-
-// StateMetadata holds Terraform state correlation data (lineage, serial, backend config).
-type StateMetadata struct {
-	Available        bool           `json:"available"`
-	Lineage          string         `json:"lineage,omitempty"`
-	Serial           int64          `json:"serial,omitempty"`
-	TerraformVersion string         `json:"terraform_version,omitempty"`
-	Backend          *BackendConfig `json:"backend,omitempty"`
-}
-
-// BackendConfig describes the Terraform backend used to store state.
-type BackendConfig struct {
-	Type               string `json:"type"`                           // "s3", "azurerm", "gcs", "local"
-	Bucket             string `json:"bucket,omitempty"`               // S3 / GCS bucket name
-	Key                string `json:"key,omitempty"`                  // S3 object key / Azure blob name
-	Region             string `json:"region,omitempty"`               // S3 region
-	StorageAccountName string `json:"storage_account_name,omitempty"` // Azure storage account
-	ContainerName      string `json:"container_name,omitempty"`       // Azure blob container
-	Prefix             string `json:"prefix,omitempty"`               // GCS prefix
+	Identity    LocalIdentity `json:"identity"`
+	Git         GitContext    `json:"git"`
+	CollectedAt time.Time     `json:"collected_at"`
 }
 
 // LocalIdentity identifies the human or system account initiating the Terraform run.
@@ -87,49 +65,6 @@ type GitContext struct {
 	CommitsBehind       int       `json:"commits_behind"`    // tracked commits not in HEAD
 }
 
-// CloudIdentity represents the normalized identity of a cloud caller.
-type CloudIdentity struct {
-	Provider    string         `json:"provider"`
-	AccountID   string         `json:"account_id"`
-	PrincipalID string         `json:"principal_id"`
-	AuthType    string         `json:"auth_type"`
-	DisplayName string         `json:"display_name,omitempty"`
-	AWS         *AWSIdentity   `json:"aws,omitempty"`
-	Azure       *AzureIdentity `json:"azure,omitempty"`
-	GCP         *GCPIdentity   `json:"gcp,omitempty"`
-}
-
-// AWSIdentity holds AWS-specific caller identity from STS GetCallerIdentity.
-type AWSIdentity struct {
-	ARN         string `json:"arn"`
-	AccountID   string `json:"account_id"`
-	UserID      string `json:"user_id"`
-	RoleARN     string `json:"role_arn,omitempty"`
-	SessionName string `json:"session_name,omitempty"`
-	RoleType    string `json:"role_type"` // "user" | "assumed-role" | "federated-user" | "root"
-}
-
-// AzureIdentity holds Azure-specific caller identity from JWT token claims.
-type AzureIdentity struct {
-	TenantID       string `json:"tenant_id"`
-	ObjectID       string `json:"object_id"`
-	ClientID       string `json:"client_id,omitempty"`
-	SubscriptionID string `json:"subscription_id,omitempty"`
-	UPN            string `json:"upn,omitempty"`
-	DisplayName    string `json:"display_name,omitempty"`
-	AuthType       string `json:"auth_type"` // "service-principal" | "managed-identity" | "user-cli" | "workload-identity"
-}
-
-// GCPIdentity holds GCP-specific caller identity from credential file or tokeninfo.
-type GCPIdentity struct {
-	ProjectID         string `json:"project_id"`
-	ClientEmail       string `json:"client_email"`
-	ClientID          string `json:"client_id,omitempty"`
-	KeyID             string `json:"key_id,omitempty"`
-	AuthType          string `json:"auth_type"` // "service-account" | "user-adc" | "workload-identity" | "gce-metadata"
-	ImpersonatedEmail string `json:"impersonated_email,omitempty"`
-}
-
 // CollectConfig controls which fields are collected (privacy toggles).
 type CollectConfig struct {
 	OSUser        bool
@@ -176,23 +111,6 @@ type FileReader interface {
 // HostnameResolver resolves the machine hostname.
 type HostnameResolver interface {
 	Hostname() (string, error)
-}
-
-// StateReader reads Terraform state from a remote backend.
-type StateReader interface {
-	ReadState(ctx context.Context, cfg *BackendConfig) ([]byte, error)
-}
-
-// STSCaller calls AWS STS GetCallerIdentity.
-type STSCaller interface {
-	GetCallerIdentity(ctx context.Context) (*STSOutput, error)
-}
-
-// STSOutput holds the raw STS GetCallerIdentity response fields.
-type STSOutput struct {
-	ARN     string
-	Account string
-	UserID  string
 }
 
 // GitOpener opens a Git repository at a given directory.
@@ -261,8 +179,6 @@ type Collector struct {
 	FS            FileReader
 	Host          HostnameResolver
 	GitOp         GitOpener
-	STS           STSCaller
-	StateR        StateReader
 	TrackedBranch string
 	TrackedRepo   string
 }
@@ -275,8 +191,7 @@ func NewCollector(config CollectConfig) *Collector {
 		User:   osUserLookup{},
 		Cmd:    execCommandRunner{},
 		FS:     osFileReader{},
-		Host:   osHostnameResolver{},
-		StateR: NewMultiStateReader(),
+		Host: osHostnameResolver{},
 	}
 }
 
@@ -289,8 +204,6 @@ func (c *Collector) Collect(ctx context.Context) *CollectionResult {
 	return &CollectionResult{
 		Identity:    c.CollectLocalIdentity(ctx),
 		Git:         c.CollectGitContext(ctx),
-		Cloud:       c.CollectCloudIdentities(ctx),
-		State:       c.CollectStateMetadata(ctx),
 		CollectedAt: time.Now().UTC(),
 	}
 }

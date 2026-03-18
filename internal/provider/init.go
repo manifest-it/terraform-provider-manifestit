@@ -84,7 +84,6 @@ func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequ
 		return
 	}
 
-	// Pass the SDK client (not the provider) to avoid import cycles
 	response.DataSourceData = p.Client
 	response.ResourceData = p.Client
 
@@ -268,7 +267,7 @@ func alreadyPostedForParent() bool {
 	return false
 }
 
-// postObserverData collects local identity, git context, and cloud identity,
+// postObserverData collects local identity and git context
 // then posts them to the ManifestIT API. Skips posting during plan-only operations.
 func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
 	var diags diag.Diagnostics
@@ -305,11 +304,8 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
 		Identity:    result.Identity,
 		Git:         result.Git,
-		Cloud:       result.Cloud,
-		State:       result.State,
 		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
-		Action:      "operation",
-		ResourceID:  "",
+		Action:      operation,
 		OrgID:       orgID,
 	})
 	if err != nil {
