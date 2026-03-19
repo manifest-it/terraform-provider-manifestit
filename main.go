@@ -23,7 +23,7 @@ func main() {
 		serveOpts.Debug = true
 	}
 
-	serveOpts.Address = "registry.terraform.io/manifestit/manifestit"
+	serveOpts.Address = "registry.terraform.io/manifest-it/manifestit"
 
 	err := providerserver.Serve(
 		ctx,
