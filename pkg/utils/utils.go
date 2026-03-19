@@ -50,20 +50,19 @@ func Retry[T any](ctx context.Context, fn func(ctx context.Context) (T, error), 
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	totalAttempts := o.MaxRetries + 1
 	var lastErr error
-	for attempt := 0; attempt < o.MaxRetries; attempt++ {
+	for attempt := 0; attempt < totalAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return zero, ctx.Err()
 		}
 
 		val, err := fn(ctx)
 
-		// Success: no error and (not empty OR empty is acceptable)
 		if err == nil && !(o.RetryOnEmptyResult && IsZero(val)) {
 			return val, nil
 		}
 
-		// Determine if we should retry
 		shouldRetry := true
 		if err != nil && o.IsRetryable != nil {
 			shouldRetry = o.IsRetryable(err)
@@ -74,8 +73,7 @@ func Retry[T any](ctx context.Context, fn func(ctx context.Context) (T, error), 
 
 		lastErr = err
 
-		// Final attempt - return error
-		if attempt == o.MaxRetries-1 {
+		if attempt == totalAttempts-1 {
 			if err != nil {
 				return zero, err
 			}
@@ -85,7 +83,6 @@ func Retry[T any](ctx context.Context, fn func(ctx context.Context) (T, error), 
 			return zero, errors.New("max retries exceeded")
 		}
 
-		// Attempt hook
 		if o.OnAttempt != nil {
 			o.OnAttempt(attempt+1, err)
 		}
