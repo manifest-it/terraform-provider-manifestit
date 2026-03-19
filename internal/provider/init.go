@@ -261,7 +261,6 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 
 	if operation != "apply" && operation != "destroy" {
 		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
-		diags.AddWarning("Skipping observer post", "Only 'apply' and 'destroy' operations are supported.")
 		return diags
 	}
 
