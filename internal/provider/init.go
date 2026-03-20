@@ -267,7 +267,6 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 	if alreadyPostedForParent() {
 		return diags
 	}
-	defer os.Remove(observerLockPath())
 
 	c := collectors.NewCollector(collectors.DefaultCollectConfig())
 	if !config.TrackedBranch.IsNull() {
@@ -352,23 +351,26 @@ func observerLockPath() string {
 func alreadyPostedForParent() bool {
 	lockPath := observerLockPath()
 
+	ppid := os.Getppid()
+	ppidStr := strconv.Itoa(ppid)
+
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err == nil {
 		defer f.Close()
-		f.Write([]byte(strconv.Itoa(os.Getpid())))
+		f.Write([]byte(ppidStr))
 		return false
 	}
 
-	// Stale lock recovery: if owner process is dead, reclaim.
+	// Stale lock recovery: if the terraform parent process is dead, reclaim.
 	data, readErr := os.ReadFile(lockPath)
 	if readErr == nil {
-		if ownerPID, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
-			if !processExists(ownerPID) {
+		if ownerPPID, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
+			if !processExists(ownerPPID) {
 				os.Remove(lockPath)
 				f2, retryErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 				if retryErr == nil {
 					defer f2.Close()
-					f2.Write([]byte(strconv.Itoa(os.Getpid())))
+					f2.Write([]byte(ppidStr))
 					return false
 				}
 			}
