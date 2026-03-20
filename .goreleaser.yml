@@ -45,4 +45,4 @@ signs:
 release:
   draft: false
 changelog:
-  skip: true
+  disable: true
