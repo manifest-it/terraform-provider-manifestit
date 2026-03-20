@@ -44,5 +44,5 @@ signs:
       - "${artifact}"
 release:
   draft: false
-changelog:
-  disable: true
+# changelog:
+#   disable: true
