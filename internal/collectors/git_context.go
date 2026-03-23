@@ -103,25 +103,6 @@ func (r *goGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
 	}, hash, nil
 }
 
-func (r *goGitRepo) IsAncestor(commitHash, branchRef string) (bool, error) {
-	commitObj, err := r.repo.CommitObject(plumbing.NewHash(commitHash))
-	if err != nil {
-		return false, err
-	}
-	ref, err := r.repo.Reference(plumbing.NewRemoteReferenceName("origin", branchRef), true)
-	if err != nil {
-		// Try local branch
-		ref, err = r.repo.Reference(plumbing.NewBranchReferenceName(branchRef), true)
-		if err != nil {
-			return false, err
-		}
-	}
-	branchCommit, err := r.repo.CommitObject(ref.Hash())
-	if err != nil {
-		return false, err
-	}
-	return commitObj.IsAncestor(branchCommit)
-}
 
 func (r *goGitRepo) CommitCounts(headHash, trackedHash string) (ahead int, behind int, err error) {
 	headCommit, err := r.repo.CommitObject(plumbing.NewHash(headHash))
@@ -230,6 +211,8 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 	// Validate repo: skip compliance check if running from wrong repository
 	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
 		gc.RepoMismatch = true
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "repo_mismatch")
 		return gc
 	}
 
@@ -248,15 +231,26 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 			gc.IsCurrentBranch = gc.Branch == c.TrackedBranch
 
 			if gc.Commit != "" {
-				if merged, err := repo.IsAncestor(gc.Commit, c.TrackedBranch); err == nil {
-					gc.IsMerged = merged
-				}
 				if ahead, behind, err := repo.CommitCounts(gc.Commit, hash); err == nil {
 					gc.CommitsAhead = ahead
 					gc.CommitsBehind = behind
 				}
 			}
 		}
+	}
+
+	// Compute drift
+	if gc.Dirty {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "uncommitted_changes")
+	}
+	if gc.CommitsAhead > 0 {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "unpushed_commits")
+	}
+	if gc.RepoMismatch {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "repo_mismatch")
 	}
 
 	return gc
@@ -293,6 +287,8 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 	// Validate repo: skip compliance check if running from wrong repository
 	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
 		gc.RepoMismatch = true
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "repo_mismatch")
 		return gc
 	}
 
@@ -325,11 +321,6 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 				}
 			}
 
-			// Ancestry check: is HEAD already in tracked branch?
-			_, mergeErr := c.Cmd.Run(ctx, dir, "git", "merge-base", "--is-ancestor", "HEAD", trackedRef)
-			gc.IsMerged = mergeErr == nil
-
-			// Divergence: ahead/behind counts
 			if counts := run("rev-list", "--left-right", "--count", "HEAD..."+trackedRef); counts != "" {
 				parts := strings.Fields(counts)
 				if len(parts) == 2 {
@@ -338,6 +329,20 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 				}
 			}
 		}
+	}
+
+	// Compute drift
+	if gc.Dirty {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "uncommitted_changes")
+	}
+	if gc.CommitsAhead > 0 {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "unpushed_commits")
+	}
+	if gc.RepoMismatch {
+		gc.DriftDetected = true
+		gc.DriftReasons = append(gc.DriftReasons, "repo_mismatch")
 	}
 
 	return gc
