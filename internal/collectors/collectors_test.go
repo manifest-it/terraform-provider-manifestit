@@ -55,9 +55,8 @@ type mockGitRepo struct {
 		info *CommitInfo
 		hash string
 	}
-	isAncestorResult bool
-	commitsAhead     int
-	commitsBehind    int
+	commitsAhead  int
+	commitsBehind int
 }
 
 func (m *mockGitRepo) HeadHash() (string, error) { return m.hash, nil }
@@ -75,9 +74,6 @@ func (m *mockGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
 	}
 	return nil, "", fmt.Errorf("branch %s not found", branch)
 }
-func (m *mockGitRepo) IsAncestor(_, _ string) (bool, error) {
-	return m.isAncestorResult, nil
-}
 func (m *mockGitRepo) CommitCounts(_, _ string) (int, int, error) {
 	return m.commitsAhead, m.commitsBehind, nil
 }
@@ -89,6 +85,15 @@ type mockGitOpener struct {
 }
 
 func (m *mockGitOpener) Open(_ string) (GitRepo, error) { return m.repo, m.err }
+
+func containsReason(reasons []string, target string) bool {
+	for _, r := range reasons {
+		if r == target {
+			return true
+		}
+	}
+	return false
+}
 
 // --- Tests ---
 
@@ -336,9 +341,8 @@ func TestCollectGitFromRepo_TrackedBranch_OnMain(t *testing.T) {
 				hash: "abc1234567890def",
 			},
 		},
-		isAncestorResult: true,
-		commitsAhead:     0,
-		commitsBehind:    0,
+		commitsAhead:  0,
+		commitsBehind: 0,
 	}
 
 	c := &Collector{
@@ -352,8 +356,8 @@ func TestCollectGitFromRepo_TrackedBranch_OnMain(t *testing.T) {
 	if gc.TrackedBranch != "main" {
 		t.Errorf("expected tracked_branch 'main', got %q", gc.TrackedBranch)
 	}
-	if !gc.IsMerged {
-		t.Error("expected is_merged=true when on main")
+	if gc.DriftDetected {
+		t.Error("expected drift_detected=false when on main with no changes")
 	}
 	if !gc.IsCurrentBranch {
 		t.Error("expected is_current_branch=true when on main")
@@ -386,9 +390,8 @@ func TestCollectGitFromRepo_TrackedBranch_FeatureBranch(t *testing.T) {
 				hash: "abc1234567890def",
 			},
 		},
-		isAncestorResult: false,
-		commitsAhead:     3,
-		commitsBehind:    0,
+		commitsAhead:  3,
+		commitsBehind: 0,
 	}
 
 	c := &Collector{
@@ -399,8 +402,11 @@ func TestCollectGitFromRepo_TrackedBranch_FeatureBranch(t *testing.T) {
 
 	gc := c.collectGitFromRepo(context.Background(), repo)
 
-	if gc.IsMerged {
-		t.Error("expected is_merged=false on feature branch")
+	if !gc.DriftDetected {
+		t.Error("expected drift_detected=true on feature branch with unpushed commits")
+	}
+	if !containsReason(gc.DriftReasons, "unpushed_commits") {
+		t.Error("expected drift_reasons to contain 'unpushed_commits'")
 	}
 	if gc.IsCurrentBranch {
 		t.Error("expected is_current_branch=false on feature branch")
@@ -431,8 +437,8 @@ func TestCollectGitFromRepo_NoTrackedBranch(t *testing.T) {
 	if gc.TrackedBranch != "" {
 		t.Errorf("expected empty tracked_branch when not configured, got %q", gc.TrackedBranch)
 	}
-	if gc.IsMerged {
-		t.Error("expected is_merged=false when tracked branch not configured")
+	if gc.DriftDetected {
+		t.Error("expected drift_detected=false when tracked branch not configured")
 	}
 }
 
@@ -456,9 +462,8 @@ func TestCollectGitFromRepo_RepoMismatch(t *testing.T) {
 				hash: "abc1234567890def",
 			},
 		},
-		isAncestorResult: true,
-		commitsAhead:     0,
-		commitsBehind:    0,
+		commitsAhead:  0,
+		commitsBehind: 0,
 	}
 
 	c := &Collector{
@@ -476,8 +481,11 @@ func TestCollectGitFromRepo_RepoMismatch(t *testing.T) {
 	if gc.TrackedBranch != "" {
 		t.Errorf("expected empty tracked_branch on repo mismatch, got %q", gc.TrackedBranch)
 	}
-	if gc.IsMerged {
-		t.Error("expected is_merged=false on repo mismatch")
+	if !gc.DriftDetected {
+		t.Error("expected drift_detected=true on repo mismatch")
+	}
+	if !containsReason(gc.DriftReasons, "repo_mismatch") {
+		t.Error("expected drift_reasons to contain 'repo_mismatch'")
 	}
 }
 
@@ -501,9 +509,8 @@ func TestCollectGitFromRepo_RepoMatch(t *testing.T) {
 				hash: "abc1234567890def",
 			},
 		},
-		isAncestorResult: true,
-		commitsAhead:     0,
-		commitsBehind:    0,
+		commitsAhead:  0,
+		commitsBehind: 0,
 	}
 
 	c := &Collector{
@@ -521,8 +528,8 @@ func TestCollectGitFromRepo_RepoMatch(t *testing.T) {
 	if gc.TrackedBranch != "main" {
 		t.Errorf("expected tracked_branch 'main', got %q", gc.TrackedBranch)
 	}
-	if !gc.IsMerged {
-		t.Error("expected is_merged=true")
+	if gc.DriftDetected {
+		t.Error("expected drift_detected=false when repo matches and on tracked branch")
 	}
 }
 
