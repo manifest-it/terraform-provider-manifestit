@@ -58,11 +58,12 @@ type GitContext struct {
 	TrackedCommitEmail  string    `json:"tracked_commit_email,omitempty"`
 	TrackedCommitMsg    string    `json:"tracked_commit_message,omitempty"`
 	TrackedCommitTime   time.Time `json:"tracked_commit_timestamp,omitempty"`
-	RepoMismatch        bool      `json:"repo_mismatch"`     // detected remote != configured tracked_repo
-	IsMerged            bool      `json:"is_merged"`         // is HEAD ancestor of tracked branch?
-	IsCurrentBranch     bool      `json:"is_current_branch"` // current branch == tracked branch?
-	CommitsAhead        int       `json:"commits_ahead"`     // HEAD commits not in tracked
-	CommitsBehind       int       `json:"commits_behind"`    // tracked commits not in HEAD
+	RepoMismatch    bool      `json:"repo_mismatch"`              // detected remote != configured tracked_repo
+	IsCurrentBranch bool      `json:"is_current_branch"`          // current branch == tracked branch?
+	CommitsAhead    int       `json:"commits_ahead"`              // HEAD commits not in tracked
+	CommitsBehind   int       `json:"commits_behind"`             // tracked commits not in HEAD
+	DriftDetected   bool      `json:"drift_detected"`             // true if any drift condition is met
+	DriftReasons    []string  `json:"drift_reasons,omitempty"`    // reasons: uncommitted_changes, unpushed_commits, repo_mismatch
 }
 
 // CollectConfig controls which fields are collected (privacy toggles).
@@ -125,7 +126,6 @@ type GitRepo interface {
 	IsDirty() (bool, error)
 	RemoteURL(name string) (string, error)
 	BranchCommit(branch string) (*CommitInfo, string, error)
-	IsAncestor(commitHash, branchRef string) (bool, error)
 	CommitCounts(refA, refB string) (ahead int, behind int, err error)
 	Close()
 }
