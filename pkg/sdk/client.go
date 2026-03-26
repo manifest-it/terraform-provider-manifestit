@@ -20,24 +20,13 @@ type APIClient struct {
 	OrgKey                  string
 	ProviderID              string
 	ProviderConfigurationID string
-	UserAgent               string
-	Logger                  zerolog.Logger
-}
-
-// APIClientConfig holds configuration for building an APIClient.
-type APIClientConfig struct {
-	Executor                *HTTPExecutor
-	BaseURL                 string
-	OrgID                   string
-	OrgKey                  string
-	ProviderID              string
-	ProviderConfigurationID string
+	ApiKey                  string
 	UserAgent               string
 	Logger                  zerolog.Logger
 }
 
 // NewAPIClient creates a new APIClient.
-func NewAPIClient(cfg APIClientConfig) *APIClient {
+func NewAPIClient(cfg APIClient) *APIClient {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "terraform-provider-manifestit/1.0"
 	}
@@ -136,6 +125,9 @@ func (c *APIClient) newRequest(ctx context.Context, method, path string, body an
 	if c.ProviderID != "" {
 		req.Header.Set("Mit-Provider-ID", c.ProviderID)
 		req.Header.Set("X-Provider", "terraform")
+	}
+	if c.ApiKey != "" {
+		req.Header.Set("Mit-Api-Key", c.ApiKey)
 	}
 	if c.ProviderConfigurationID != "" {
 		req.Header.Set("Mit-Provider-Config-ID", c.ProviderConfigurationID)
