@@ -51,13 +51,14 @@ func NewProviderClient(cfg Config) (*ProviderClient, error) {
 		MaxRetries: cfg.MaxRetries,
 	})
 
-	api := sdk.NewAPIClient(sdk.APIClientConfig{
+	api := sdk.NewAPIClient(sdk.APIClient{
 		Executor:                executor,
 		BaseURL:                 cfg.BaseURL,
 		OrgID:                   cfg.OrgID,
 		OrgKey:                  cfg.OrgKey,
 		ProviderID:              cfg.ProviderID,
 		ProviderConfigurationID: cfg.ProviderConfigurationID,
+		ApiKey:                  cfg.APIKey,
 		Logger:                  cfg.Logger,
 	})
 
