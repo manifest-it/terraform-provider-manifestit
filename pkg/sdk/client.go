@@ -36,6 +36,7 @@ func NewAPIClient(cfg APIClient) *APIClient {
 		OrgID:                   cfg.OrgID,
 		OrgKey:                  cfg.OrgKey,
 		ProviderID:              cfg.ProviderID,
+		ApiKey:                  cfg.ApiKey,
 		ProviderConfigurationID: cfg.ProviderConfigurationID,
 		UserAgent:               cfg.UserAgent,
 		Logger:                  cfg.Logger,
