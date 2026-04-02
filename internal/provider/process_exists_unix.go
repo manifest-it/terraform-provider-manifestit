@@ -3,6 +3,7 @@
 package provider
 
 import (
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 func processExistsPlatform(pid int) bool {
 	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func getParentCommandLinePlatform(pid int) (string, error) {

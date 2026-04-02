@@ -15,6 +15,7 @@ import (
 	"terraform-provider-manifestit/pkg/utils"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -28,6 +29,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// heartbeatCancel holds the cancel func for the running heartbeat goroutine.
+// Set once inside providerRunOnce; read by RunCleanup.
+var heartbeatCancel context.CancelFunc
+
 var (
 	_ provider.Provider = &Provider{}
 )
@@ -36,12 +41,12 @@ type Provider struct {
 	HttpClient *http.Client
 	Client     *providers.ProviderClient
 
-	ConfigureCallbackFunc func(p *Provider, request *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics
+	ConfigureCallbackFunc func(p *Provider, request *provider.ConfigureRequest, config *Schema) diag.Diagnostics
 	Now                   func() time.Time
 	DefaultTags           map[string]string
 }
 
-type ProviderSchema struct {
+type Schema struct {
 	ApiKey                    types.String `tfsdk:"api_key"`
 	ApiUrl                    types.String `tfsdk:"api_url"`
 	Validate                  types.String `tfsdk:"validate"`
@@ -68,7 +73,7 @@ func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 }
 
 func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequest, response *provider.ConfigureResponse) {
-	var config ProviderSchema
+	var config Schema
 	response.Diagnostics.Append(request.Config.Get(ctx, &config)...)
 	if response.Diagnostics.HasError() {
 		return
@@ -89,7 +94,7 @@ func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequ
 	response.Diagnostics.Append(p.postObserverData(ctx, &config)...)
 }
 
-func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	if config.ApiKey.IsNull() {
@@ -123,7 +128,7 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 	return diags
 }
 
-func (p *Provider) ValidateConfigValues(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+func (p *Provider) ValidateConfigValues(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 	oneOfStringValidator := stringvalidator.OneOf("true", "false")
 	int64BetweenValidator := int64validator.Between(1, 5)
@@ -210,7 +215,7 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 	}
 }
 
-func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics {
+func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	debug := os.Getenv("DEBUG") == "true"
@@ -252,7 +257,7 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 	return diags
 }
 
-func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+func (p *Provider) postObserverData(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 	operation := detectTerraformOperation()
 
@@ -261,35 +266,128 @@ func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema)
 		return diags
 	}
 
-	if alreadyPostedForParent() {
+	// providerRunOnce ensures the full open/heartbeat/close lifecycle starts
+	// at most once per process, even when Configure() is called multiple times
+	// (e.g. aliased provider blocks). The second call is a complete no-op.
+	providerRunOnce.Do(func() {
+		diags = p.startObserverLifecycle(ctx, config, operation)
+	})
+
+	return diags
+}
+
+// startObserverLifecycle acquires the lock, POSTs /open, starts the heartbeat,
+// registers the SIGTERM handler, and registers the RunCleanup close path.
+// It is called at most once per process via providerRunOnce.Do.
+func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, operation string) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	runID, lockPath, alreadyPosted := acquireRunLock()
+	if alreadyPosted {
+		// Another plugin instance for this same terraform invocation already
+		// owns the lifecycle (concurrent parallelism). Skip silently.
 		return diags
 	}
-
-	c := collectors.NewCollector(collectors.DefaultCollectConfig())
-	if !config.TrackedBranch.IsNull() {
-		c.TrackedBranch = config.TrackedBranch.ValueString()
-	}
-	if !config.TrackedRepo.IsNull() {
-		c.TrackedRepo = config.TrackedRepo.ValueString()
-	}
-	result := c.Collect(ctx)
 
 	orgID := ""
 	if !config.OrgId.IsNull() {
 		orgID = strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
 	}
+	trackedBranch := ""
+	if !config.TrackedBranch.IsNull() {
+		trackedBranch = config.TrackedBranch.ValueString()
+	}
+	trackedRepo := ""
+	if !config.TrackedRepo.IsNull() {
+		trackedRepo = config.TrackedRepo.ValueString()
+	}
+	providerConfigID := ""
+	if !config.ProviderConfigurationId.IsNull() {
+		providerConfigID = strconv.FormatInt(int64(config.ProviderConfigurationId.ValueInt32()), 10)
+	}
+	providerID := ""
+	if !config.ProviderId.IsNull() {
+		providerID = strconv.FormatInt(int64(config.ProviderId.ValueInt32()), 10)
+	}
 
-	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
-		Identity:    result.Identity,
-		Git:         result.Git,
-		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
+	// Collect identity + git NOW, inside Configure(), so CI env vars are
+	// captured while the provider process still inherits them from terraform.
+	// The SIGTERM handler and RunCleanup run later, potentially after those
+	// env vars are gone.
+	c := collectors.NewCollector(collectors.DefaultCollectConfig())
+	c.TrackedBranch = trackedBranch
+	c.TrackedRepo = trackedRepo
+	collectCtx, collectCancel := context.WithTimeout(ctx, 8*time.Second)
+	result := c.Collect(collectCtx)
+	collectCancel()
+
+	// POST /open — retry up to PostOpenMaxRetries times with exponential backoff.
+	_, postErr := p.Client.Observer.Post(ctx, observer.ObserverPayload{
+		RunID:       runID,
+		Status:      "open",
+		CollectedAt: time.Now().UTC().Format(time.RFC3339),
 		Action:      operation,
 		OrgID:       orgID,
 	})
-	if err != nil {
-		diags.AddWarning("ManifestIT observer post failed", err.Error())
+	if postErr != nil {
+		// All retries exhausted — release the lock so the next terraform run
+		// can start a fresh lifecycle, then surface a warning (not an error).
+		_ = os.Remove(lockPath)
+		diags.AddWarning("ManifestIT observer open event failed", postErr.Error())
+		return diags
 	}
+
+	// Build ClosureState in memory — no disk I/O, no JSON serialisation.
+	state := ClosureState{
+		RunID:    runID,
+		Action:   operation,
+		APIKey:   config.ApiKey.ValueString(),
+		BaseURL:  config.ApiUrl.ValueString(),
+		OrgID:    orgID,
+		OrgKey:   config.OrgKey.ValueString(),
+		LockPath: lockPath,
+		// Pre-collected identity/git so close event carries full context.
+		Identity: result.Identity,
+		Git:      result.Git,
+	}
+	_ = providerConfigID // retained in client; not needed in ClosureState
+	_ = providerID       // same
+
+	// Create a cancellable context for the heartbeat goroutine.
+	hbCtx, cancel := context.WithCancel(context.Background())
+	heartbeatCancel = cancel
+
+	// Start the heartbeat goroutine (ticker-based, leak-free).
+	startHeartbeat(hbCtx, p.Client.Observer, runID)
+
+	// Register SIGTERM handler (CI close path).
+	registerSIGTERMHandler(cancel, p.Client.Observer, runID, state)
+
+	// Register the RunCleanup close path (local / normal-exit path).
+	// main.go calls RunCleanup() after provider server.Serve() returns.
+	obs := p.Client.Observer
+	RegisterCleanup(func() {
+		cancel() // stop heartbeat goroutine
+		providerCloseOnce.Do(func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
+			defer closeCancel()
+			fireCloseEvent(closeCtx, obs, runID, state)
+			_ = os.Remove(lockPath)
+		})
+	})
+
+	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
+		map[string]interface{}{
+			"run_id":    runID,
+			"operation": operation,
+		})
+
 	return diags
+}
+
+// generateRunID generates a random UUID v4 using github.com/google/uuid.
+func generateRunID() string {
+	return uuid.New().String()
 }
 
 // detectTerraformOperation reads the parent process command line to determine
@@ -322,39 +420,75 @@ func observerLockPath() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("manifestit-observer-%d.lock", ppid))
 }
 
-// alreadyPostedForParent uses atomic file creation (O_CREATE|O_EXCL) to
-// deduplicate across plan and apply provider invocations within a single
-// terraform command. Reclaims stale locks from crashed runs.
-func alreadyPostedForParent() bool {
-	lockPath := observerLockPath()
-
+// acquireRunLock atomically creates the per-PPID lock file and returns:
+//   - runID       – a newly generated UUID v4 for this terraform run
+//   - lockPath    – the path of the lock file written
+//   - alreadyPosted – true if another Configure() call for the same terraform
+//     invocation already acquired the lock (idempotency guard)
+//
+// Atomicity: uses os.Link (hard link) for the creation step. link(2) is atomic
+// on POSIX and fails with EEXIST when the target already exists, so exactly one
+// concurrent caller wins per lock-creation attempt.
+//
+// Stale locks (owner PID no longer alive) are reclaimed via remove + re-link,
+// with a read-back verify to detect the rare case where two callers both removed
+// the stale lock and raced to re-link.
+func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
+	lockPath = observerLockPath()
 	ppid := os.Getppid()
-	ppidStr := strconv.Itoa(ppid)
+	ppidS := strconv.Itoa(ppid)
+	runID = generateRunID()
+	content := ppidS + ":" + runID
+	dir := filepath.Dir(lockPath)
 
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		f.Write([]byte(ppidStr))
-		return false
+	// Write our content to a uniquely-named temp file, then hard-link it to
+	// the lock path. link(2) is atomic and fails if the target already exists.
+	tmp, tmpErr := os.CreateTemp(dir, ".lock-tmp-")
+	if tmpErr != nil {
+		return "", lockPath, true
+	}
+	tmpPath := tmp.Name()
+	_, _ = tmp.WriteString(content)
+	_ = tmp.Close()
+	defer os.Remove(tmpPath) // always clean up temp file
+
+	if linkErr := os.Link(tmpPath, lockPath); linkErr == nil {
+		// Atomically created the lock — we own it.
+		return runID, lockPath, false
 	}
 
-	// Stale lock recovery: if the terraform parent process is dead, reclaim.
+	// Lock file already exists — check if it is stale.
 	data, readErr := os.ReadFile(lockPath)
-	if readErr == nil {
-		if ownerPPID, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
-			if !processExists(ownerPPID) {
-				os.Remove(lockPath)
-				f2, retryErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-				if retryErr == nil {
-					defer f2.Close()
-					f2.Write([]byte(ppidStr))
-					return false
-				}
-			}
+	if readErr != nil {
+		return "", lockPath, true
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	if len(parts) < 1 {
+		return "", lockPath, true
+	}
+	if ownerPPID, parseErr := strconv.Atoi(parts[0]); parseErr == nil {
+		if processExists(ownerPPID) {
+			// Live owner — already posted for this terraform run.
+			return "", lockPath, true
 		}
+	} else {
+		return "", lockPath, true
 	}
 
-	return true
+	// Stale lock (owner dead). Remove it and race to re-link.
+	// If another instance already removed and re-linked, our Link fails and we yield.
+	_ = os.Remove(lockPath)
+	if linkErr := os.Link(tmpPath, lockPath); linkErr != nil {
+		return "", lockPath, true
+	}
+
+	// Verify ownership — confirm our content is still there.
+	check, checkErr := os.ReadFile(lockPath)
+	if checkErr != nil || strings.TrimSpace(string(check)) != content {
+		return "", lockPath, true
+	}
+
+	return runID, lockPath, false
 }
 
 func processExists(pid int) bool {
