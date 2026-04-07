@@ -151,6 +151,37 @@ func proxyEnv() []string {
 	return env
 }
 
+// cleanStaleFiles removes observer lock files and watcher state files in
+// stateDir() whose owner PPID is no longer alive. Called at apply start so
+// files from crashed/killed previous runs don't accumulate.
+func cleanStaleFiles() {
+	dir := stateDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		// observer-{ppid}.lock
+		if filepath.Ext(name) == ".lock" {
+			var ppid int
+			if _, err := fmt.Sscanf(name, "observer-%d.lock", &ppid); err == nil {
+				if !processExists(ppid) {
+					os.Remove(filepath.Join(dir, name))
+				}
+			}
+			continue
+		}
+		// watcher-{random}.json — read PPID from content
+		if filepath.Ext(name) == ".json" {
+			path := filepath.Join(dir, name)
+			if s, err := readRunState(path); err == nil && !processExists(s.PPID) {
+				os.Remove(path)
+			}
+		}
+	}
+}
+
 // WatcherMain is the entry point when MIT_WATCHER_MODE=1.
 // Polls terraform PPID and fires PATCH /closed when it exits.
 func WatcherMain() {

@@ -222,6 +222,8 @@ func (p *Provider) startLifecycle(ctx context.Context, config *Schema) diag.Diag
 		return diags
 	}
 
+	cleanStaleFiles()
+
 	providerRunOnce.Do(func() {
 		diags = p.runLifecycle(ctx, config, operation)
 	})
