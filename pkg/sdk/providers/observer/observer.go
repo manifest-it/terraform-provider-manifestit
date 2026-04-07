@@ -130,31 +130,56 @@ func (c *client) Post(ctx context.Context, input ObserverPayload) (*ObserverResp
 	return nil, fmt.Errorf("observer post failed after %d retries: %w", PostOpenMaxRetries, lastErr)
 }
 
+// PatchMaxRetries is the number of retries for PATCH /closed.
+const PatchMaxRetries = 3
+
 func (c *client) Patch(ctx context.Context, runID string, input ClosePayload) (*ObserverResponse, error) {
-	body, status, err := c.api.Patch(ctx, basePath+"/"+runID, input)
+	var lastErr error
+	backoff := PostOpenRetryBase // reuse same base (500ms)
 
-	// 409 Conflict or 410 Gone: event already closed/timed-out — idempotent, not an error.
-	// Check status first; HTTPExecutor returns a non-nil error for all 4xx but
-	// also returns the numeric status so we can distinguish 409/410 here.
-	if status == http.StatusConflict || status == http.StatusGone {
-		return &ObserverResponse{}, nil
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("observer patch failed: %w", err)
-	}
-
-	if hErr := sdkErrors.Handle(status, body); hErr != nil {
-		return nil, hErr
-	}
-
-	var result ObserverResponse
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("failed to parse observer patch response: %w", err)
+	for attempt := 0; attempt <= PatchMaxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("observer patch cancelled: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > PostOpenRetryMax {
+				backoff = PostOpenRetryMax
+			}
 		}
+
+		body, status, err := c.api.Patch(ctx, basePath+"/"+runID, input)
+
+		// 409 Conflict or 410 Gone: event already closed/timed-out — idempotent.
+		if status == http.StatusConflict || status == http.StatusGone {
+			return &ObserverResponse{}, nil
+		}
+
+		if err != nil {
+			lastErr = fmt.Errorf("observer patch failed: %w", err)
+			continue // retry on transport error
+		}
+
+		if hErr := sdkErrors.Handle(status, body); hErr != nil {
+			lastErr = hErr
+			if !isTransient(status) {
+				return nil, lastErr // non-retryable (e.g. 404 bad run_id)
+			}
+			continue
+		}
+
+		var result ObserverResponse
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &result); err != nil {
+				return nil, fmt.Errorf("failed to parse observer patch response: %w", err)
+			}
+		}
+		return &result, nil
 	}
-	return &result, nil
+
+	return nil, fmt.Errorf("observer patch failed after %d retries: %w", PatchMaxRetries, lastErr)
 }
 
 // Heartbeat sends a { "status": "heartbeat" } PATCH to keep the server event

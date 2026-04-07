@@ -280,8 +280,10 @@ func buildProviderClient(apiKey, baseURL, orgID, orgKey string) (observer.Client
 func (p *Provider) postObserverData(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 	operation := detectTerraformOperation()
+	providerLog("detected operation=%s pid=%d ppid=%d", operation, os.Getpid(), os.Getppid())
 
 	if operation != "apply" && operation != "destroy" {
+		providerLog("skipping lifecycle — operation is not apply/destroy")
 		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
 		return diags
 	}
@@ -304,10 +306,11 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 
 	runID, lockPath, alreadyPosted := acquireRunLock()
 	if alreadyPosted {
-		// Another plugin instance for this same terraform invocation already
-		// owns the lifecycle (concurrent parallelism). Skip silently.
+		providerLog("lock already held — skipping lifecycle (another instance owns this run)")
 		return diags
 	}
+	providerLog("lifecycle start  operation=%s run_id=%s pid=%d ppid=%d",
+		operation, runID, os.Getpid(), os.Getppid())
 
 	orgID := ""
 	if !config.OrgId.IsNull() {
@@ -330,18 +333,17 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		providerID = strconv.FormatInt(int64(config.ProviderId.ValueInt32()), 10)
 	}
 
-	// Collect identity + git NOW, inside Configure(), so CI env vars are
-	// captured while the provider process still inherits them from terraform.
-	// The SIGTERM handler and RunCleanup run later, potentially after those
-	// env vars are gone.
 	c := collectors.NewCollector(collectors.DefaultCollectConfig())
 	c.TrackedBranch = trackedBranch
 	c.TrackedRepo = trackedRepo
 	collectCtx, collectCancel := context.WithTimeout(ctx, 8*time.Second)
 	result := c.Collect(collectCtx)
 	collectCancel()
+	providerLog("identity/git collected  identity_type=%s git_available=%v",
+		result.Identity.Type, result.Git.Available)
 
-	// POST /open — retry up to PostOpenMaxRetries times with exponential backoff.
+	// POST /open
+	providerLog("POST /open  run_id=%s base_url=%s", runID, config.ApiUrl.ValueString())
 	_, postErr := p.Client.Observer.Post(ctx, observer.ObserverPayload{
 		RunID:       runID,
 		Status:      "open",
@@ -350,14 +352,13 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		OrgID:       orgID,
 	})
 	if postErr != nil {
-		// All retries exhausted — release the lock so the next terraform run
-		// can start a fresh lifecycle, then surface a warning (not an error).
+		providerLog("POST /open FAILED: %v — removing lock", postErr)
 		_ = os.Remove(lockPath)
 		diags.AddWarning("ManifestIT observer open event failed", postErr.Error())
 		return diags
 	}
+	providerLog("POST /open OK")
 
-	// Build ClosureState — written to disk for the watcher subprocess.
 	state := ClosureState{
 		RunID:    runID,
 		Action:   operation,
@@ -366,7 +367,7 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		OrgID:    orgID,
 		OrgKey:   config.OrgKey.ValueString(),
 		LockPath: lockPath,
-		PPID:     os.Getppid(), // terraform binary PID — watcher polls this
+		PPID:     os.Getppid(),
 		Identity: result.Identity,
 		Git:      result.Git,
 	}
@@ -374,45 +375,37 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 	_ = providerID
 
 	obs := p.Client.Observer
-
-	// Heartbeat context — cancelled by SIGTERM handler.
 	hbCtx, cancel := context.WithCancel(context.Background())
 	heartbeatCancel = cancel
 
-	// Start heartbeat goroutine — proves liveness every 30s while plugin runs.
 	startHeartbeat(hbCtx, obs, runID)
+	providerLog("heartbeat goroutine started  interval=%s", HeartbeatInterval)
 
-	// Register SIGTERM handler — CI close path.
-	// Now accepts ctx so the goroutine exits cleanly when ctx is cancelled
-	// (i.e. when RunCleanup is called after Serve() returns), preventing a
-	// goroutine leak in normal local runs where SIGTERM never fires.
 	registerSIGTERMHandler(hbCtx, cancel, obs, runID, state)
+	providerLog("SIGTERM handler registered")
 
-	// Spawn watcher subprocess — PRIMARY local close path.
-	// The watcher runs in its own session (Setsid=true), survives go-plugin's
-	// SIGKILL, polls PPID every 2s, and fires PATCH /closed when terraform exits.
-	// This fires AFTER all providers (AWS, GCP, time, etc.) finish — no depends_on needed.
+	// Spawn watcher subprocess — PRIMARY close path
 	statePath, writeErr := writeClosureState(state)
 	if writeErr != nil {
+		providerLog("watcher state write FAILED: %v", writeErr)
 		tflog.Warn(ctx, "ManifestIT: failed to write watcher state — closed event may not fire",
 			map[string]interface{}{"error": writeErr.Error()})
 		diags.AddWarning("ManifestIT watcher state write failed", writeErr.Error())
 	} else if spawnErr := spawnWatcher(statePath); spawnErr != nil {
+		providerLog("watcher spawn FAILED: %v", spawnErr)
 		os.Remove(statePath)
 		tflog.Warn(ctx, "ManifestIT: failed to spawn watcher — closed event may not fire",
 			map[string]interface{}{"error": spawnErr.Error()})
 		diags.AddWarning("ManifestIT watcher spawn failed", spawnErr.Error())
+	} else {
+		providerLog("watcher subprocess spawned  state=%s ppid=%d", statePath, os.Getppid())
 	}
 
-	// RegisterCleanup is a no-op safety net — by the time Serve() returns,
-	// go-plugin is about to SIGKILL us. The watcher subprocess handles close.
 	RegisterCleanup(func() { cancel() })
+	providerLog("lifecycle setup complete — watcher will fire PATCH /closed when PPID exits")
 
 	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
-		map[string]interface{}{
-			"run_id":    runID,
-			"operation": operation,
-		})
+		map[string]interface{}{"run_id": runID, "operation": operation})
 
 	return diags
 }

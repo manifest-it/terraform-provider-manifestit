@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,21 +47,34 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	events = append(events, ev)
+	n := len(events)
 	mu.Unlock()
 
-	// Pretty-print to stdout so you can watch events arrive in real time.
-	pretty, _ := json.MarshalIndent(ev, "", "  ")
-	fmt.Printf("\n── event #%d ──────────────────────────────────────\n%s\n", len(events), string(pretty))
-
-	// Return a minimal valid response that the provider SDK will accept.
-	runID := "mock-server-run-id"
-	// Extract run_id from body if present, so PATCH response echoes it back.
+	// Decode status for display
 	var payload map[string]any
-	if json.Unmarshal(body, &payload) == nil {
-		if id, ok := payload["run_id"].(string); ok && id != "" {
-			runID = id
-		}
+	_ = json.Unmarshal(body, &payload)
+	status, _ := payload["status"].(string)
+	runID, _ := payload["run_id"].(string)
+	if runID == "" {
+		// PATCH path has run_id in URL
+		parts := strings.Split(r.URL.Path, "/")
+		runID = parts[len(parts)-1]
 	}
+
+	// Colour-coded real-time output
+	color := map[string]string{
+		"open":      "\033[32m", // green
+		"closed":    "\033[31m", // red
+		"heartbeat": "\033[33m", // yellow
+	}
+	reset := "\033[0m"
+	c := color[status]
+	if c == "" {
+		c = "\033[36m" // cyan for unknown
+	}
+	fmt.Printf("\n%s── event #%d  [%s]  %s  %s %s%s\n",
+		c, n, strings.ToUpper(status), ev.ReceivedAt.Format("15:04:05"), r.Method, r.URL.Path, reset)
+	fmt.Printf("   run_id: %s\n", runID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)

@@ -24,6 +24,25 @@ var providerRunOnce sync.Once
 var providerCloseOnce sync.Once
 
 // --------------------------------------------------------------------------
+// providerLog — always-on file logger (no TF_LOG needed)
+// --------------------------------------------------------------------------
+
+// providerLog writes a timestamped line to $TMPDIR/manifestit-provider-{ppid}.log.
+// This file is always created — you don't need TF_LOG=DEBUG to see provider activity.
+// Check it after any terraform apply to see what the provider did.
+func providerLog(format string, args ...any) {
+	logPath := filepath.Join(os.TempDir(),
+		fmt.Sprintf("manifestit-provider-%d.log", os.Getppid()))
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	ts := time.Now().UTC().Format("15:04:05.000")
+	fmt.Fprintf(f, "[%s] "+format+"\n", append([]any{ts}, args...)...)
+}
+
+// --------------------------------------------------------------------------
 // Timing constants
 // --------------------------------------------------------------------------
 
@@ -158,19 +177,49 @@ func spawnWatcher(statePath string) error {
 		return fmt.Errorf("cannot find executable: %w", err)
 	}
 
+	// Resolve symlinks — on some systems os.Executable returns a symlink.
+	// The subprocess must exec the real file.
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	// Log file written to TempDir — readable even after the provider process
+	// is SIGKILL'd by go-plugin, since the subprocess holds the fd open.
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("manifestit-watcher-%d.log", os.Getppid()))
+	logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+
 	cmd := exec.Command(exe)
 	cmd.Env = []string{
 		"MIT_WATCHER_MODE=1",
 		"MIT_WATCHER_STATE=" + statePath,
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
 	}
-	// Setsid puts the subprocess in its own session so go-plugin's
-	// Kill(-pgid) does not reach it.
+	for _, key := range []string{
+		"SSL_CERT_FILE", "SSL_CERT_DIR",
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+	} {
+		if v := os.Getenv(key); v != "" {
+			cmd.Env = append(cmd.Env, key+"="+v)
+		}
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	cmd.Stdin = nil
 
-	return cmd.Start()
+	if startErr := cmd.Start(); startErr != nil {
+		if logFile != nil {
+			logFile.Close()
+		}
+		return startErr
+	}
+	// Close the parent's copy of the fd — the child has its own copy.
+	if logFile != nil {
+		logFile.Close()
+	}
+	return nil
 }
 
 // --------------------------------------------------------------------------
@@ -194,6 +243,9 @@ func WatcherMain() {
 	// Remove the state file immediately — it contains credentials.
 	_ = os.Remove(statePath)
 
+	fmt.Fprintf(os.Stderr, "manifestit-watcher: started, run_id=%s ppid=%d base_url=%s\n",
+		state.RunID, state.PPID, state.BaseURL)
+
 	obs, err := buildObserverFromState(state)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "manifestit-watcher: cannot build observer: %v\n", err)
@@ -201,8 +253,7 @@ func WatcherMain() {
 	}
 
 	// Poll until terraform (PPID) exits.
-	// PPID only exits after ALL providers have finished — this is the correct
-	// "all done" signal without requiring any user depends_on configuration.
+	fmt.Fprintf(os.Stderr, "manifestit-watcher: polling ppid=%d every %s\n", state.PPID, ppidPollInterval)
 	for {
 		time.Sleep(ppidPollInterval)
 		if !processExists(state.PPID) {
@@ -210,10 +261,13 @@ func WatcherMain() {
 		}
 	}
 
+	fmt.Fprintf(os.Stderr, "manifestit-watcher: ppid=%d exited, firing close event at %s\n",
+		state.PPID, time.Now().UTC().Format(time.RFC3339))
 	ctx, cancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
 	defer cancel()
 	fireCloseEvent(ctx, obs, state.RunID, state)
 	_ = os.Remove(state.LockPath)
+	fmt.Fprintf(os.Stderr, "manifestit-watcher: done at %s\n", time.Now().UTC().Format(time.RFC3339))
 }
 
 // --------------------------------------------------------------------------
@@ -247,15 +301,14 @@ func registerSIGTERMHandler(ctx context.Context, cancel context.CancelFunc, obs 
 		defer signal.Stop(ch)
 		select {
 		case <-ctx.Done():
-			// Normal exit — heartbeat context cancelled (Serve() returned,
-			// RunCleanup() called). SIGTERM never arrived. Exit cleanly.
+			providerLog("SIGTERM handler exiting cleanly (context cancelled — normal exit)")
 			return
 		case <-ch:
-			// CI teardown: SIGTERM received.
 		}
 
+		providerLog("SIGTERM received — firing PATCH /closed immediately")
 		fmt.Fprintf(os.Stderr, "manifestit: caught SIGTERM — firing close event\n")
-		cancel() // stop heartbeat goroutine
+		cancel()
 
 		providerCloseOnce.Do(func() {
 			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
@@ -302,7 +355,12 @@ func fireCloseEvent(ctx context.Context, obs observer.Client, runID string, stat
 		OrgID:       state.OrgID,
 	})
 	if patchErr != nil {
-		fmt.Fprintf(os.Stderr, "manifestit: PATCH /closed failed: %v\n", patchErr)
+		providerLog("PATCH /closed FAILED (run_id=%s base_url=%s): %v", runID, state.BaseURL, patchErr)
+		fmt.Fprintf(os.Stderr, "manifestit: PATCH /closed FAILED (run_id=%s base_url=%s): %v\n",
+			runID, state.BaseURL, patchErr)
+	} else {
+		providerLog("PATCH /closed OK (run_id=%s)", runID)
+		fmt.Fprintf(os.Stderr, "manifestit: PATCH /closed OK (run_id=%s)\n", runID)
 	}
 }
 
