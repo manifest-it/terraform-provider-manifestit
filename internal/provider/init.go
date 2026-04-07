@@ -402,21 +402,9 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 	}
 
 	RegisterCleanup(func() {
-		cancel() // stop heartbeat goroutine
-
-		// PRIMARY local-run close path.
-		// Runs after providerserver.Serve() returns in main.go, which happens
-		// when terraform closes the gRPC connection (normal apply finish or
-		// ctrl+c via go-plugin). The watcher subprocess is a belt-and-suspenders
-		// fallback; this is the reliable path for local runs.
-		providerCloseOnce.Do(func() {
-			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
-			defer closeCancel()
-			fireCloseEvent(closeCtx, obs, runID, state)
-			_ = os.Remove(state.LockPath)
-		})
+		cancel() // stop heartbeat goroutine — watcher subprocess owns PATCH /closed
 	})
-	providerLog("lifecycle setup complete — RunCleanup will fire PATCH /closed when Serve() returns")
+	providerLog("lifecycle setup complete — watcher will fire PATCH /closed when PPID exits")
 
 	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
 		map[string]interface{}{"run_id": runID, "operation": operation})
@@ -476,31 +464,16 @@ func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
 	lockPath = observerLockPath()
 	runID = generateRunID()
 
-	// Use PPID (terraform binary) as the owner identifier — NOT the plugin's
-	// own PID. Terraform spawns the provider binary multiple times per apply
-	// (GetSchema, ValidateConfig, PlanResourceChange, ApplyResourceChange),
-	// each as a short-lived process that exits in <100ms. If we stored the
-	// plugin's own PID, each process death makes the lock look stale and the
-	// next instance reclaims it → duplicate open events.
-	//
-	// Storing PPID: as long as terraform is alive, processExists(PPID)=true →
-	// all subsequent plugin instances see a live owner → alreadyPosted=true →
-	// exactly one open event per terraform run.
-	//
-	// Note: the lock path itself encodes PPID (manifestit-observer-{ppid}.lock),
-	// so locks from different terraform runs naturally use different paths —
-	// there is NO cross-run conflict and NO stale reclaim is ever needed.
-	// Any existing lock at our path was created by THIS terraform run (same PPID).
 	ppid := os.Getppid()
 	ppidS := strconv.Itoa(ppid)
 	content := ppidS + ":" + runID
 	dir := filepath.Dir(lockPath)
 
-	// Write candidate content to a uniquely-named temp file, then hard-link
-	// it to the lock path. link(2) is atomic on POSIX: exactly one caller
-	// wins when multiple race on the same target path.
+	providerLog("acquireRunLock: lockPath=%s pid=%d ppid=%d", lockPath, os.Getpid(), ppid)
+
 	tmp, tmpErr := os.CreateTemp(dir, ".lock-tmp-")
 	if tmpErr != nil {
+		providerLog("acquireRunLock: CreateTemp failed: %v → alreadyPosted=true", tmpErr)
 		return "", lockPath, true
 	}
 	tmpPath := tmp.Name()
@@ -509,48 +482,47 @@ func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
 	defer os.Remove(tmpPath)
 
 	if linkErr := os.Link(tmpPath, lockPath); linkErr == nil {
-		// Atomically created the lock — we are the owner.
+		providerLog("acquireRunLock: os.Link succeeded — we own the lock (new owner)")
 		return runID, lockPath, false
+	} else {
+		providerLog("acquireRunLock: os.Link failed (%v) — lock exists, checking owner", linkErr)
 	}
 
-	// Lock already exists at this PPID-keyed path.
-	// Since the path encodes PPID, this lock was created by another plugin
-	// instance from the same terraform run. Read it to check liveness.
 	data, readErr := os.ReadFile(lockPath)
 	if readErr != nil {
-		// Lock disappeared (cleaned up between our failed Link and now).
-		// Be conservative: treat as already posted to avoid a duplicate open.
+		providerLog("acquireRunLock: lock disappeared after failed Link (%v) → alreadyPosted=true", readErr)
 		return "", lockPath, true
 	}
+	providerLog("acquireRunLock: lock content=%q", strings.TrimSpace(string(data)))
 	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
 	if len(parts) < 1 {
+		providerLog("acquireRunLock: bad lock content → alreadyPosted=true")
 		return "", lockPath, true
 	}
 	ownerPPID, parseErr := strconv.Atoi(parts[0])
 	if parseErr != nil {
+		providerLog("acquireRunLock: cannot parse ownerPPID from %q → alreadyPosted=true", parts[0])
 		return "", lockPath, true
 	}
-	if processExists(ownerPPID) {
-		// Terraform is alive → same run → already posted.
+	alive := processExists(ownerPPID)
+	providerLog("acquireRunLock: ownerPPID=%d alive=%v", ownerPPID, alive)
+	if alive {
 		return "", lockPath, true
 	}
 
-	// Owner PPID is dead. This means a PREVIOUS terraform run left a stale
-	// lock (shouldn't happen since the path encodes PPID, but guard anyway —
-	// e.g. if PPID was reused by the OS). Clean it up and claim ownership.
-	//
-	// Since we are the only instance that can reach here (same PPID path,
-	// same terraform run — terraform is dead so no concurrent instances),
-	// just remove and re-link. The final verify catches any remaining race.
+	// Stale lock — owner PPID is dead
+	providerLog("acquireRunLock: stale lock (ownerPPID=%d dead) — reclaiming", ownerPPID)
 	_ = os.Remove(lockPath)
 	if linkErr := os.Link(tmpPath, lockPath); linkErr != nil {
+		providerLog("acquireRunLock: re-link after stale remove failed (%v) → alreadyPosted=true", linkErr)
 		return "", lockPath, true
 	}
 	check, checkErr := os.ReadFile(lockPath)
 	if checkErr != nil || strings.TrimSpace(string(check)) != content {
+		providerLog("acquireRunLock: verify after re-link failed → alreadyPosted=true")
 		return "", lockPath, true
 	}
-
+	providerLog("acquireRunLock: stale lock reclaimed — we own the lock")
 	return runID, lockPath, false
 }
 
