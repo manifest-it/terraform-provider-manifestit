@@ -401,8 +401,22 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		providerLog("watcher subprocess spawned  state=%s ppid=%d", statePath, os.Getppid())
 	}
 
-	RegisterCleanup(func() { cancel() })
-	providerLog("lifecycle setup complete — watcher will fire PATCH /closed when PPID exits")
+	RegisterCleanup(func() {
+		cancel() // stop heartbeat goroutine
+
+		// PRIMARY local-run close path.
+		// Runs after providerserver.Serve() returns in main.go, which happens
+		// when terraform closes the gRPC connection (normal apply finish or
+		// ctrl+c via go-plugin). The watcher subprocess is a belt-and-suspenders
+		// fallback; this is the reliable path for local runs.
+		providerCloseOnce.Do(func() {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
+			defer closeCancel()
+			fireCloseEvent(closeCtx, obs, runID, state)
+			_ = os.Remove(state.LockPath)
+		})
+	})
+	providerLog("lifecycle setup complete — RunCleanup will fire PATCH /closed when Serve() returns")
 
 	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
 		map[string]interface{}{"run_id": runID, "operation": operation})

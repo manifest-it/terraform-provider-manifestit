@@ -114,10 +114,13 @@ func RegisterCleanup(fn func()) {
 	}
 }
 
-// RunCleanup is called from main.go after Serve() returns.
-// By the time Serve() returns, go-plugin is about to SIGKILL the process.
-// The watcher subprocess already handles PATCH /closed.
-// This just cancels the heartbeat goroutine so it exits cleanly.
+// RunCleanup is called from main.go after Serve() returns (gRPC connection
+// closed by terraform — normal apply finish, ctrl+c, or plugin shutdown).
+// This is the PRIMARY close path for local runs: it fires PATCH /closed and
+// cancels the heartbeat goroutine. The watcher subprocess is a fallback that
+// also fires the close event if the process is SIGKILL'd before this runs.
+// providerCloseOnce ensures exactly one PATCH /closed is sent regardless of
+// which path fires first.
 func RunCleanup() {
 	cleanupMu.Lock()
 	fn := cleanupFn
