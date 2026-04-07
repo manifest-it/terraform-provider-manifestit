@@ -38,5 +38,4 @@ module "infra" {
 # -------------------------------
 
 resource "manifestit_observer" "final" {
-  depends_on = [module.infra]
 }

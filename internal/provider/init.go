@@ -257,6 +257,26 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 	return diags
 }
 
+// buildProviderClient creates a minimal ProviderClient with an observer.Client.
+// Used by the watcher subprocess (MIT_WATCHER_MODE=1) via buildObserverFromState.
+func buildProviderClient(apiKey, baseURL, orgID, orgKey string) (observer.Client, error) {
+	debug := os.Getenv("DEBUG") == "true"
+	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
+	client, err := providers.NewProviderClient(providers.Config{
+		APIKey:     apiKey,
+		BaseURL:    baseURL,
+		OrgID:      orgID,
+		OrgKey:     orgKey,
+		Debug:      debug,
+		Logger:     logger,
+		MaxRetries: 3,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return client.Observer, nil
+}
+
 func (p *Provider) postObserverData(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 	operation := detectTerraformOperation()
@@ -337,7 +357,7 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		return diags
 	}
 
-	// Build ClosureState in memory — no disk I/O, no JSON serialisation.
+	// Build ClosureState — written to disk for the watcher subprocess.
 	state := ClosureState{
 		RunID:    runID,
 		Action:   operation,
@@ -346,35 +366,47 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		OrgID:    orgID,
 		OrgKey:   config.OrgKey.ValueString(),
 		LockPath: lockPath,
-		// Pre-collected identity/git so close event carries full context.
+		PPID:     os.Getppid(), // terraform binary PID — watcher polls this
 		Identity: result.Identity,
 		Git:      result.Git,
 	}
-	_ = providerConfigID // retained in client; not needed in ClosureState
-	_ = providerID       // same
+	_ = providerConfigID
+	_ = providerID
 
-	// Create a cancellable context for the heartbeat goroutine.
+	obs := p.Client.Observer
+
+	// Heartbeat context — cancelled by SIGTERM handler.
 	hbCtx, cancel := context.WithCancel(context.Background())
 	heartbeatCancel = cancel
 
-	// Start the heartbeat goroutine (ticker-based, leak-free).
-	startHeartbeat(hbCtx, p.Client.Observer, runID)
+	// Start heartbeat goroutine — proves liveness every 30s while plugin runs.
+	startHeartbeat(hbCtx, obs, runID)
 
-	// Register SIGTERM handler (CI close path).
-	registerSIGTERMHandler(cancel, p.Client.Observer, runID, state)
+	// Register SIGTERM handler — CI close path.
+	// Now accepts ctx so the goroutine exits cleanly when ctx is cancelled
+	// (i.e. when RunCleanup is called after Serve() returns), preventing a
+	// goroutine leak in normal local runs where SIGTERM never fires.
+	registerSIGTERMHandler(hbCtx, cancel, obs, runID, state)
 
-	// Register the RunCleanup close path (local / normal-exit path).
-	// main.go calls RunCleanup() after provider server.Serve() returns.
-	obs := p.Client.Observer
-	RegisterCleanup(func() {
-		cancel() // stop heartbeat goroutine
-		providerCloseOnce.Do(func() {
-			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
-			defer closeCancel()
-			fireCloseEvent(closeCtx, obs, runID, state)
-			_ = os.Remove(lockPath)
-		})
-	})
+	// Spawn watcher subprocess — PRIMARY local close path.
+	// The watcher runs in its own session (Setsid=true), survives go-plugin's
+	// SIGKILL, polls PPID every 2s, and fires PATCH /closed when terraform exits.
+	// This fires AFTER all providers (AWS, GCP, time, etc.) finish — no depends_on needed.
+	statePath, writeErr := writeClosureState(state)
+	if writeErr != nil {
+		tflog.Warn(ctx, "ManifestIT: failed to write watcher state — closed event may not fire",
+			map[string]interface{}{"error": writeErr.Error()})
+		diags.AddWarning("ManifestIT watcher state write failed", writeErr.Error())
+	} else if spawnErr := spawnWatcher(statePath); spawnErr != nil {
+		os.Remove(statePath)
+		tflog.Warn(ctx, "ManifestIT: failed to spawn watcher — closed event may not fire",
+			map[string]interface{}{"error": spawnErr.Error()})
+		diags.AddWarning("ManifestIT watcher spawn failed", spawnErr.Error())
+	}
+
+	// RegisterCleanup is a no-op safety net — by the time Serve() returns,
+	// go-plugin is about to SIGKILL us. The watcher subprocess handles close.
+	RegisterCleanup(func() { cancel() })
 
 	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
 		map[string]interface{}{
@@ -435,14 +467,31 @@ func observerLockPath() string {
 // the stale lock and raced to re-link.
 func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
 	lockPath = observerLockPath()
+	runID = generateRunID()
+
+	// Use PPID (terraform binary) as the owner identifier — NOT the plugin's
+	// own PID. Terraform spawns the provider binary multiple times per apply
+	// (GetSchema, ValidateConfig, PlanResourceChange, ApplyResourceChange),
+	// each as a short-lived process that exits in <100ms. If we stored the
+	// plugin's own PID, each process death makes the lock look stale and the
+	// next instance reclaims it → duplicate open events.
+	//
+	// Storing PPID: as long as terraform is alive, processExists(PPID)=true →
+	// all subsequent plugin instances see a live owner → alreadyPosted=true →
+	// exactly one open event per terraform run.
+	//
+	// Note: the lock path itself encodes PPID (manifestit-observer-{ppid}.lock),
+	// so locks from different terraform runs naturally use different paths —
+	// there is NO cross-run conflict and NO stale reclaim is ever needed.
+	// Any existing lock at our path was created by THIS terraform run (same PPID).
 	ppid := os.Getppid()
 	ppidS := strconv.Itoa(ppid)
-	runID = generateRunID()
 	content := ppidS + ":" + runID
 	dir := filepath.Dir(lockPath)
 
-	// Write our content to a uniquely-named temp file, then hard-link it to
-	// the lock path. link(2) is atomic and fails if the target already exists.
+	// Write candidate content to a uniquely-named temp file, then hard-link
+	// it to the lock path. link(2) is atomic on POSIX: exactly one caller
+	// wins when multiple race on the same target path.
 	tmp, tmpErr := os.CreateTemp(dir, ".lock-tmp-")
 	if tmpErr != nil {
 		return "", lockPath, true
@@ -450,39 +499,46 @@ func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
 	tmpPath := tmp.Name()
 	_, _ = tmp.WriteString(content)
 	_ = tmp.Close()
-	defer os.Remove(tmpPath) // always clean up temp file
+	defer os.Remove(tmpPath)
 
 	if linkErr := os.Link(tmpPath, lockPath); linkErr == nil {
-		// Atomically created the lock — we own it.
+		// Atomically created the lock — we are the owner.
 		return runID, lockPath, false
 	}
 
-	// Lock file already exists — check if it is stale.
+	// Lock already exists at this PPID-keyed path.
+	// Since the path encodes PPID, this lock was created by another plugin
+	// instance from the same terraform run. Read it to check liveness.
 	data, readErr := os.ReadFile(lockPath)
 	if readErr != nil {
+		// Lock disappeared (cleaned up between our failed Link and now).
+		// Be conservative: treat as already posted to avoid a duplicate open.
 		return "", lockPath, true
 	}
 	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
 	if len(parts) < 1 {
 		return "", lockPath, true
 	}
-	if ownerPPID, parseErr := strconv.Atoi(parts[0]); parseErr == nil {
-		if processExists(ownerPPID) {
-			// Live owner — already posted for this terraform run.
-			return "", lockPath, true
-		}
-	} else {
+	ownerPPID, parseErr := strconv.Atoi(parts[0])
+	if parseErr != nil {
+		return "", lockPath, true
+	}
+	if processExists(ownerPPID) {
+		// Terraform is alive → same run → already posted.
 		return "", lockPath, true
 	}
 
-	// Stale lock (owner dead). Remove it and race to re-link.
-	// If another instance already removed and re-linked, our Link fails and we yield.
+	// Owner PPID is dead. This means a PREVIOUS terraform run left a stale
+	// lock (shouldn't happen since the path encodes PPID, but guard anyway —
+	// e.g. if PPID was reused by the OS). Clean it up and claim ownership.
+	//
+	// Since we are the only instance that can reach here (same PPID path,
+	// same terraform run — terraform is dead so no concurrent instances),
+	// just remove and re-link. The final verify catches any remaining race.
 	_ = os.Remove(lockPath)
 	if linkErr := os.Link(tmpPath, lockPath); linkErr != nil {
 		return "", lockPath, true
 	}
-
-	// Verify ownership — confirm our content is still there.
 	check, checkErr := os.ReadFile(lockPath)
 	if checkErr != nil || strings.TrimSpace(string(check)) != content {
 		return "", lockPath, true

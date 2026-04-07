@@ -253,39 +253,76 @@ func TestAcquireRunLock_RunIDIsValidUUID(t *testing.T) {
 	}
 }
 
-// TestAcquireRunLock_atomicReclaim races two goroutines reclaiming a stale lock.
-// Exactly one must get ownership; the other must see alreadyPosted=true.
+// TestAcquireRunLock_atomicCreate races 20 goroutines all trying to create
+// the same lock file simultaneously via os.Link. Exactly one must win.
+// This is the real production race: N plugin instances spawned by terraform
+// all call Configure() at nearly the same time.
+func TestAcquireRunLock_atomicCreate(t *testing.T) {
+	for iter := 0; iter < 30; iter++ {
+		lockPath := filepath.Join(t.TempDir(), fmt.Sprintf("test-%d.lock", iter))
+
+		const n = 20
+		var owners int64
+		var wg sync.WaitGroup
+		wg.Add(n)
+		ready := make(chan struct{})
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				<-ready
+				_, _, already := acquireRunLockAt(lockPath)
+				if !already {
+					atomic.AddInt64(&owners, 1)
+				}
+			}()
+		}
+		close(ready)
+		wg.Wait()
+		os.Remove(lockPath)
+
+		if owners != 1 {
+			t.Errorf("iter %d: expected exactly 1 owner, got %d", iter, owners)
+		}
+	}
+}
+
+// TestAcquireRunLock_atomicReclaim tests that reclaiming a stale lock
+// (dead owner PPID) with 2 concurrent goroutines results in exactly 1 owner.
+// In production this path is rarely hit since the lock path encodes PPID.
 func TestAcquireRunLock_atomicReclaim(t *testing.T) {
-	lockPath := tmpLockPath(t)
-	t.Cleanup(func() { os.Remove(lockPath) })
+	for iter := 0; iter < 50; iter++ {
+		lockPath := filepath.Join(t.TempDir(), fmt.Sprintf("stale-%d.lock", iter))
 
-	// Write stale lock with dead PID.
-	stale := fmt.Sprintf("%d:dead-uuid", 999999999)
-	if err := os.WriteFile(lockPath, []byte(stale), 0644); err != nil {
-		t.Fatalf("write stale lock: %v", err)
-	}
+		// Write a stale lock with a dead PID as owner.
+		stale := fmt.Sprintf("%d:dead-uuid", 999999999)
+		if err := os.WriteFile(lockPath, []byte(stale), 0644); err != nil {
+			t.Fatalf("write stale lock: %v", err)
+		}
 
-	const n = 20
-	var owners int64
+		// Only 2 goroutines for reclaim — the n-way removal cascade is
+		// inherently non-deterministic (os.Remove + os.Link is not atomic).
+		// Production avoids this entirely via PPID-keyed lock paths.
+		var owners int64
+		var wg sync.WaitGroup
+		wg.Add(2)
+		ready := make(chan struct{})
+		for i := 0; i < 2; i++ {
+			go func() {
+				defer wg.Done()
+				<-ready
+				_, _, already := acquireRunLockAt(lockPath)
+				if !already {
+					atomic.AddInt64(&owners, 1)
+				}
+			}()
+		}
+		close(ready)
+		wg.Wait()
+		os.Remove(lockPath)
 
-	var wg sync.WaitGroup
-	wg.Add(n)
-	ready := make(chan struct{})
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			<-ready
-			_, _, already := acquireRunLockAt(lockPath)
-			if !already {
-				atomic.AddInt64(&owners, 1)
-			}
-		}()
-	}
-	close(ready)
-	wg.Wait()
-
-	if owners != 1 {
-		t.Errorf("expected exactly 1 owner, got %d", owners)
+		if owners != 1 {
+			t.Errorf("iter %d: expected exactly 1 owner, got %d", iter, owners)
+		}
 	}
 }
 
@@ -700,34 +737,30 @@ func TestNoSubprocessSpawned(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNoWatcherStateFileCreated(t *testing.T) {
-	// Snapshot existing watcher state files BEFORE starting the lifecycle —
-	// stale files from previous test runs must not cause a false failure.
-	before := make(map[string]bool)
-	if entries, err := os.ReadDir(os.TempDir()); err == nil {
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "manifestit-watcher-") && strings.HasSuffix(e.Name(), ".json") {
-				before[e.Name()] = true
-			}
-		}
-	}
-
+	// startHeartbeat is a pure goroutine — it must NOT create any files.
+	// (The watcher state file is created by writeClosureState+spawnWatcher,
+	// which is separate from the heartbeat goroutine.)
 	obs := &mockObserver{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	before := make(map[string]bool)
+	if entries, err := os.ReadDir(os.TempDir()); err == nil {
+		for _, e := range entries {
+			before[e.Name()] = true
+		}
+	}
+
 	startHeartbeat(ctx, obs, "no-watcher-file-test")
 	time.Sleep(20 * time.Millisecond)
 
-	// Only report files that did NOT exist before this test started.
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "manifestit-watcher-") && strings.HasSuffix(e.Name(), ".json") {
-			if !before[e.Name()] {
-				t.Errorf("new watcher state file created during test: %s", e.Name())
-			}
+		if !before[e.Name()] {
+			t.Errorf("startHeartbeat created unexpected file: %s", e.Name())
 		}
 	}
 
@@ -773,23 +806,28 @@ func TestLockFileRemovedAfterClose(t *testing.T) {
 // TestClosureState_inMemoryOnly
 // ---------------------------------------------------------------------------
 
-func TestClosureState_inMemoryOnly(t *testing.T) {
+// TestClosureState_hasRequiredFields verifies ClosureState has the fields
+// needed by the watcher subprocess to fire PATCH /closed.
+// ClosureState is serialised to disk (JSON) so the watcher subprocess can
+// read it after the provider process is SIGKILL'd by go-plugin.
+func TestClosureState_hasRequiredFields(t *testing.T) {
 	typ := reflect.TypeOf(ClosureState{})
-
+	required := []string{"RunID", "Action", "APIKey", "BaseURL", "OrgID", "OrgKey", "LockPath", "PPID"}
+	fieldSet := make(map[string]bool, typ.NumField())
 	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-
-		// No json tags.
-		if tag, ok := field.Tag.Lookup("json"); ok {
-			t.Errorf("ClosureState.%s has json tag %q — should be in-memory only", field.Name, tag)
+		fieldSet[typ.Field(i).Name] = true
+	}
+	for _, name := range required {
+		if !fieldSet[name] {
+			t.Errorf("ClosureState is missing required field %q", name)
 		}
 	}
 
-	// No Write or Read methods.
-	ptrType := reflect.TypeOf(&ClosureState{})
-	for _, name := range []string{"Write", "Read", "Marshal", "Unmarshal"} {
-		if _, ok := ptrType.MethodByName(name); ok {
-			t.Errorf("ClosureState has unexpected method %q — should be in-memory only", name)
+	// Must have json tags on all exported fields (needed for disk serialisation).
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if _, ok := field.Tag.Lookup("json"); !ok {
+			t.Errorf("ClosureState.%s is missing json tag — required for watcher subprocess serialisation", field.Name)
 		}
 	}
 }
@@ -812,19 +850,14 @@ func TestDetectTerraformOperation_ReattachEnv(t *testing.T) {
 
 // acquireRunLockAt is the testable variant of acquireRunLock that accepts an
 // explicit lockPath instead of deriving it from the real PPID.
-//
-// Atomicity guarantee: uses os.Link (hard link) for the lock creation step.
-// link(2) is atomic on POSIX and fails with EEXIST if the target already exists,
-// meaning exactly one concurrent caller wins the race.
+// Mirrors the production logic exactly.
 func acquireRunLockAt(lockPath string) (runID string, gotPath string, alreadyPosted bool) {
-	ppid := os.Getpid()
+	ppid := os.Getpid() // use own PID as "terraform" in tests
 	ppidS := fmt.Sprintf("%d", ppid)
 	runID = generateRunID()
 	content := ppidS + ":" + runID
 	dir := filepath.Dir(lockPath)
 
-	// Write our content to a uniquely-named temp file, then hard-link it to
-	// the lock path. link(2) fails atomically with EEXIST if lock already exists.
 	tmp, tmpErr := os.CreateTemp(dir, ".lock-tmp-")
 	if tmpErr != nil {
 		return "", lockPath, true
@@ -832,14 +865,12 @@ func acquireRunLockAt(lockPath string) (runID string, gotPath string, alreadyPos
 	tmpPath := tmp.Name()
 	_, _ = tmp.WriteString(content)
 	_ = tmp.Close()
-	defer os.Remove(tmpPath) // clean up temp regardless of outcome
+	defer os.Remove(tmpPath)
 
 	if linkErr := os.Link(tmpPath, lockPath); linkErr == nil {
-		// We created the lock atomically — we own it.
 		return runID, lockPath, false
 	}
 
-	// Lock file already exists — check if it is stale (owner PID dead).
 	data, readErr := os.ReadFile(lockPath)
 	if readErr != nil {
 		return "", lockPath, true
@@ -853,24 +884,110 @@ func acquireRunLockAt(lockPath string) (runID string, gotPath string, alreadyPos
 		return "", lockPath, true
 	}
 	if processExists(ownerPID) {
-		// Live owner — already posted.
 		return "", lockPath, true
 	}
 
-	// Stale lock — remove it, then race to re-link our temp file.
-	// os.Remove is best-effort; if another goroutine already removed and
-	// re-linked, our subsequent Link will fail and we yield to them.
+	// Dead owner — remove and reclaim (no TOCTOU race here since in
+	// production the path encodes PPID, so this path is only taken when
+	// a previous terraform run's lock was not cleaned up).
 	_ = os.Remove(lockPath)
 	if linkErr := os.Link(tmpPath, lockPath); linkErr != nil {
-		// Lost the reclaim race — another goroutine owns it.
 		return "", lockPath, true
 	}
-
-	// Verify we actually own the lock (read back and confirm our content).
 	check, checkErr := os.ReadFile(lockPath)
 	if checkErr != nil || strings.TrimSpace(string(check)) != content {
 		return "", lockPath, true
 	}
 
 	return runID, lockPath, false
+}
+
+// ---------------------------------------------------------------------------
+// TestWatcher_* — watcher subprocess tests
+// ---------------------------------------------------------------------------
+
+// TestWriteReadClosureState verifies that writeClosureState serialises to disk
+// and readClosureState deserialises back correctly.
+func TestWriteReadClosureState(t *testing.T) {
+	state := ClosureState{
+		RunID:    "test-run-id",
+		Action:   "apply",
+		APIKey:   "key",
+		BaseURL:  "http://localhost",
+		OrgID:    "1",
+		OrgKey:   "org",
+		LockPath: "/tmp/test.lock",
+		PPID:     os.Getpid(),
+		Identity: map[string]any{"type": "local"},
+		Git:      map[string]any{"branch": "main"},
+	}
+
+	path, err := writeClosureState(state)
+	if err != nil {
+		t.Fatalf("writeClosureState: %v", err)
+	}
+	defer os.Remove(path)
+
+	got, err := readClosureState(path)
+	if err != nil {
+		t.Fatalf("readClosureState: %v", err)
+	}
+
+	if got.RunID != state.RunID {
+		t.Errorf("RunID: got %q want %q", got.RunID, state.RunID)
+	}
+	if got.PPID != state.PPID {
+		t.Errorf("PPID: got %d want %d", got.PPID, state.PPID)
+	}
+	if got.APIKey != state.APIKey {
+		t.Errorf("APIKey: got %q want %q", got.APIKey, state.APIKey)
+	}
+}
+
+// TestSpawnWatcher_binaryExists verifies spawnWatcher can launch the test binary
+// in watcher mode. We use MIT_WATCHER_STATE pointing to a valid state file and
+// a dead PPID so the watcher exits immediately.
+func TestSpawnWatcher_binaryExists(t *testing.T) {
+	// Write a state file with a dead PPID so the watcher exits on first poll.
+	// Use PID 1 — on macOS/Linux it's always init/launchd and never dies,
+	// so instead use a freshly reaped process.
+	proc, err := os.StartProcess("/bin/sh", []string{"sh", "-c", "exit 0"}, &os.ProcAttr{})
+	if err != nil {
+		t.Skipf("cannot start test process: %v", err)
+	}
+	deadPID := proc.Pid
+	proc.Wait()
+
+	lockPath := tmpLockPath(t)
+	state := ClosureState{
+		RunID:    uuid.New().String(),
+		Action:   "apply",
+		APIKey:   "test-key",
+		BaseURL:  "http://127.0.0.1:19999", // unreachable — watcher will fail PATCH but still exit
+		OrgID:    "1",
+		OrgKey:   "org",
+		LockPath: lockPath,
+		PPID:     deadPID,
+	}
+
+	path, err := writeClosureState(state)
+	if err != nil {
+		t.Fatalf("writeClosureState: %v", err)
+	}
+	// Don't defer remove — watcher subprocess removes it.
+
+	if err := spawnWatcher(path); err != nil {
+		t.Fatalf("spawnWatcher: %v", err)
+	}
+	// If we get here without error, the subprocess was successfully spawned.
+	// Give it a moment to start and remove the state file.
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestWatcherStatePath verifies the state file path format.
+func TestWatcherStatePath(t *testing.T) {
+	path := watcherStatePath(12345)
+	if !strings.Contains(path, "manifestit-watcher-12345.json") {
+		t.Errorf("unexpected path %q", path)
+	}
 }

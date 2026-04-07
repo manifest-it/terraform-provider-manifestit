@@ -2,9 +2,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -17,59 +20,64 @@ import (
 // Package-level lifecycle guards
 // --------------------------------------------------------------------------
 
-// providerRunOnce ensures the entire open/heartbeat/close lifecycle is started
-// at most once per process, even if Configure() is called multiple times
-// (e.g. aliased provider blocks in the same terraform run).
 var providerRunOnce sync.Once
-
-// providerCloseOnce guarantees exactly one PATCH /closed per process.
-// It is shared between the SIGTERM handler (CI path) and RunCleanup()
-// (local / normal-exit path) so whichever fires first wins.
 var providerCloseOnce sync.Once
 
 // --------------------------------------------------------------------------
-// HeartbeatInterval and related timing constants
+// Timing constants
 // --------------------------------------------------------------------------
 
 const (
-	// HeartbeatInterval is how often the plugin sends a heartbeat to the server.
-	HeartbeatInterval = 30 * time.Second
-
-	// ServerTimeoutWindow is the documented server-side inactivity window.
-	// The server marks an event "timed_out" if no heartbeat is received for
-	// this duration. Two consecutive heartbeat failures must occur before
-	// the server times out (30s interval × 2 = 60s < ServerTimeoutWindow).
+	HeartbeatInterval   = 30 * time.Second
+	ppidPollInterval    = 2 * time.Second
 	ServerTimeoutWindow = 60 * time.Second
 )
 
 // --------------------------------------------------------------------------
-// ClosureState — in-memory only, no serialisation, no disk I/O
+// ClosureState — serialised to disk for the watcher subprocess
 // --------------------------------------------------------------------------
 
-// ClosureState carries the information needed to fire the "closed" event.
-// It is populated once in Configure() and passed by value to both the SIGTERM
-// handler goroutine and the RunCleanup deferred function in main.go.
-//
-// Design: no JSON tags, no file I/O — this struct exists only in memory
-// for the lifetime of the provider process.
+// ClosureState carries everything the watcher subprocess needs to fire the
+// closed event. Written to a temp file by the provider process; read by
+// the watcher subprocess (MIT_WATCHER_MODE=1).
 type ClosureState struct {
-	RunID    string
-	Action   string
-	APIKey   string
-	BaseURL  string
-	OrgID    string
-	OrgKey   string
-	LockPath string
+	RunID    string `json:"run_id"`
+	Action   string `json:"action"`
+	APIKey   string `json:"api_key"`
+	BaseURL  string `json:"base_url"`
+	OrgID    string `json:"org_id"`
+	OrgKey   string `json:"org_key"`
+	LockPath string `json:"lock_path"`
+	PPID     int    `json:"ppid"`
 
-	// Pre-collected during Configure() so CI env vars are captured at the
-	// right moment. The SIGTERM handler and RunCleanup run later, potentially
-	// after env vars have been cleared.
-	Identity any
-	Git      any
+	Identity any `json:"identity,omitempty"`
+	Git      any `json:"git,omitempty"`
+}
+
+func writeClosureState(state ClosureState) (string, error) {
+	f, err := os.CreateTemp("", "manifestit-watcher-*.json")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := json.NewEncoder(f).Encode(state); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func readClosureState(path string) (ClosureState, error) {
+	var s ClosureState
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return s, err
+	}
+	return s, json.Unmarshal(data, &s)
 }
 
 // --------------------------------------------------------------------------
-// Cleanup registry (called from main.go after Serve() returns)
+// Cleanup registry — called from main.go after Serve() returns
 // --------------------------------------------------------------------------
 
 var (
@@ -77,10 +85,8 @@ var (
 	cleanupFn func()
 )
 
-// RegisterCleanup stores a cleanup function to be called by RunCleanup().
-// It is called once from Configure() after the heartbeat goroutine is started.
-// If called multiple times (should not happen due to providerRunOnce), only
-// the first registration is kept.
+// RegisterCleanup stores fn to be called by RunCleanup().
+// Only the first registration is kept.
 func RegisterCleanup(fn func()) {
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
@@ -89,11 +95,10 @@ func RegisterCleanup(fn func()) {
 	}
 }
 
-// RunCleanup executes the registered cleanup function exactly once.
-// Called from main.go immediately after providerserver.Serve() returns.
-// Serve() blocks for the entire terraform run, so this is the correct
-// clean-exit path for normal apply completion and ctrl+c (SIGINT handled
-// by go-plugin which lets Serve() return cleanly).
+// RunCleanup is called from main.go after Serve() returns.
+// By the time Serve() returns, go-plugin is about to SIGKILL the process.
+// The watcher subprocess already handles PATCH /closed.
+// This just cancels the heartbeat goroutine so it exits cleanly.
 func RunCleanup() {
 	cleanupMu.Lock()
 	fn := cleanupFn
@@ -107,27 +112,9 @@ func RunCleanup() {
 // startHeartbeat
 // --------------------------------------------------------------------------
 
-// startHeartbeat starts a goroutine that sends a heartbeat to the server every
-// HeartbeatInterval, proving the provider process is still alive.
-//
-// Why we replaced the watcher-subprocess / PPID-polling approach:
-//
-//  1. PPID polling fails for remote execution backends (TFC, Atlantis) where
-//     the PPID is a long-lived agent process, not the terraform command itself.
-//  2. The detached subprocess ran in its own session (Setsid=true). On CI, the
-//     cgroup teardown could kill it before it fired the close event.
-//  3. sync.Once is per-process. The subprocess and the provider process each had
-//     their own sync.Once, so duplicate PATCH /closed calls were possible (BUG-1).
-//  4. The 4-hour safety cap fired "closed" unconditionally, closing still-running
-//     applies on the server (BUG-2).
-//  5. The heartbeat model moves the "is this run still alive?" decision to the
-//     server. The plugin simply proves liveness every 30 seconds. The server
-//     marks a run "timed_out" after 60 seconds of silence — catching SIGKILL,
-//     network partition, and remote-execution scenarios correctly.
-//
-// The goroutine exits cleanly when ctx is cancelled. Heartbeat errors are
-// logged as warnings but never stop the goroutine — a transient error must not
-// interrupt the heartbeat loop.
+// startHeartbeat starts a goroutine that sends PATCH {status:heartbeat} every
+// HeartbeatInterval. The goroutine exits cleanly when ctx is cancelled.
+// Errors are non-fatal — a transient network error must not stop the loop.
 func startHeartbeat(ctx context.Context, obs observer.Client, runID string) {
 	go func() {
 		ticker := time.NewTicker(HeartbeatInterval)
@@ -138,61 +125,145 @@ func startHeartbeat(ctx context.Context, obs observer.Client, runID string) {
 				return
 			case <-ticker.C:
 				if err := obs.Heartbeat(ctx, runID); err != nil {
-					fmt.Fprintf(os.Stderr, "manifestit: heartbeat warning (non-fatal): %v\n", err)
+					fmt.Fprintf(os.Stderr, "manifestit: heartbeat warning: %v\n", err)
 				}
 			}
 		}
 	}()
 }
 
-// sigTermReraiseHook is called after the close event fires instead of the real
-// syscall.Kill re-raise. It is nil in production (real kill used) and set to a
-// no-op in unit tests so the test process is not terminated.
+// --------------------------------------------------------------------------
+// spawnWatcher — detached self-re-exec subprocess
+// --------------------------------------------------------------------------
+
+// spawnWatcher spawns a detached copy of this binary with MIT_WATCHER_MODE=1.
+//
+// Why a subprocess and not a goroutine:
+//
+//	Terraform's go-plugin calls client.Kill() on the provider after the gRPC
+//	connection closes. Kill() sends SIGKILL to the plugin process — which cannot
+//	be caught. A goroutine inside the plugin process dies with it. A subprocess
+//	running in its own session (Setsid=true) is NOT in the plugin's process
+//	group and survives the SIGKILL, giving it time to poll PPID and fire
+//	PATCH /closed after ALL providers (AWS, GCP, etc.) have finished.
+//
+// The subprocess:
+//   - reads ClosureState from the temp file at statePath
+//   - polls PPID (terraform binary) every 2s
+//   - fires PATCH /closed when PPID exits (= all providers done)
+//   - removes the state file and lock file, then exits
+func spawnWatcher(statePath string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot find executable: %w", err)
+	}
+
+	cmd := exec.Command(exe)
+	cmd.Env = []string{
+		"MIT_WATCHER_MODE=1",
+		"MIT_WATCHER_STATE=" + statePath,
+	}
+	// Setsid puts the subprocess in its own session so go-plugin's
+	// Kill(-pgid) does not reach it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+
+	return cmd.Start()
+}
+
+// --------------------------------------------------------------------------
+// WatcherMain — entry point when MIT_WATCHER_MODE=1
+// --------------------------------------------------------------------------
+
+// WatcherMain is called by main.go when MIT_WATCHER_MODE=1.
+// It polls PPID (terraform) and fires PATCH /closed when it exits.
+func WatcherMain() {
+	statePath := os.Getenv("MIT_WATCHER_STATE")
+	if statePath == "" {
+		fmt.Fprintln(os.Stderr, "manifestit-watcher: MIT_WATCHER_STATE not set")
+		os.Exit(1)
+	}
+
+	state, err := readClosureState(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "manifestit-watcher: cannot read state: %v\n", err)
+		os.Exit(1)
+	}
+	// Remove the state file immediately — it contains credentials.
+	_ = os.Remove(statePath)
+
+	obs, err := buildObserverFromState(state)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "manifestit-watcher: cannot build observer: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Poll until terraform (PPID) exits.
+	// PPID only exits after ALL providers have finished — this is the correct
+	// "all done" signal without requiring any user depends_on configuration.
+	for {
+		time.Sleep(ppidPollInterval)
+		if !processExists(state.PPID) {
+			break
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
+	defer cancel()
+	fireCloseEvent(ctx, obs, state.RunID, state)
+	_ = os.Remove(state.LockPath)
+}
+
+// --------------------------------------------------------------------------
+// registerSIGTERMHandler — CI close path
+// --------------------------------------------------------------------------
+
+// sigTermReraiseHook replaces syscall.Kill in tests to prevent killing the
+// test process. Nil in production.
 var sigTermReraiseHook func()
 
-// --------------------------------------------------------------------------
-// registerSIGTERMHandler — CI-reliable close path
-// --------------------------------------------------------------------------
-
-// registerSIGTERMHandler installs a SIGTERM-only handler in the provider process.
+// registerSIGTERMHandler installs a SIGTERM handler for the CI close path.
 //
-// This is the CI close path. When a CI runner tears down a job step it sends
-// SIGTERM to the entire process group. Because go-plugin does NOT set Setpgid,
-// the plugin inherits terraform's PGID and receives SIGTERM directly.
+// In CI, the runner sends SIGTERM to the process group when tearing down a
+// job step. The plugin shares terraform's PGID (go-plugin does not set
+// Setsid), so it receives SIGTERM directly. go-plugin only intercepts SIGINT,
+// so our handler fires first.
 //
-// go-plugin v1.7.0 only registers signal.Notify for os.Interrupt (SIGINT) and
-// deliberately ignores it. SIGTERM is not registered by go-plugin, so our
-// handler below is the first code to receive it.
+// On SIGTERM:
+//  1. cancel() stops the heartbeat goroutine.
+//  2. providerCloseOnce fires PATCH /closed immediately (no need to wait
+//     for PPID — the CI job is being killed so terraform is also dying).
+//  3. SIGTERM is re-raised so go-plugin and terraform exit normally.
 //
-// SIGINT is intentionally NOT handled here:
-//   - go-plugin already registers SIGINT and handles it by letting Serve() return.
-//   - Multiple signal.Notify registrations on the same channel are non-deterministic.
-//   - When Serve() returns (including after ctrl+c), RunCleanup() fires the close
-//     event via the normal exit path — no signal handler needed for SIGINT.
-func registerSIGTERMHandler(cancel context.CancelFunc, obs observer.Client, runID string, state ClosureState) {
+// The goroutine also exits when ctx is cancelled (normal plugin exit path),
+// preventing a goroutine leak in the local run case where SIGTERM never fires.
+func registerSIGTERMHandler(ctx context.Context, cancel context.CancelFunc, obs observer.Client, runID string, state ClosureState) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM)
 
 	go func() {
-		<-ch
-		signal.Stop(ch)
+		defer signal.Stop(ch)
+		select {
+		case <-ctx.Done():
+			// Normal exit — heartbeat context cancelled (Serve() returned,
+			// RunCleanup() called). SIGTERM never arrived. Exit cleanly.
+			return
+		case <-ch:
+			// CI teardown: SIGTERM received.
+		}
 
 		fmt.Fprintf(os.Stderr, "manifestit: caught SIGTERM — firing close event\n")
-
-		// Stop the heartbeat goroutine before sending the close event.
-		cancel()
+		cancel() // stop heartbeat goroutine
 
 		providerCloseOnce.Do(func() {
-			ctx, cancelClose := context.WithTimeout(context.Background(), observer.CloseDeadline)
-			defer cancelClose()
-			fireCloseEvent(ctx, obs, runID, state)
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
+			defer closeCancel()
+			fireCloseEvent(closeCtx, obs, runID, state)
 			_ = os.Remove(state.LockPath)
 		})
 
-		// Re-raise SIGTERM so go-plugin and terraform receive it and exit normally.
-		// Without this re-raise the process would hang waiting for gRPC shutdown.
-		// In unit tests sigTermReraiseHook is set to a no-op to prevent killing the
-		// test binary.
 		if sigTermReraiseHook != nil {
 			sigTermReraiseHook()
 		} else {
@@ -205,13 +276,12 @@ func registerSIGTERMHandler(cancel context.CancelFunc, obs observer.Client, runI
 // fireCloseEvent
 // --------------------------------------------------------------------------
 
-// fireCloseEvent sends the PATCH /closed event using pre-collected context.
-// Falls back to re-collecting identity/git only if not already populated.
 func fireCloseEvent(ctx context.Context, obs observer.Client, runID string, state ClosureState) {
 	identity := state.Identity
 	git := state.Git
 
-	// Fallback: re-collect only if not pre-populated (should not happen in normal flow).
+	// Fallback re-collect only if pre-collection was skipped (should not
+	// happen in normal flow — identity/git are collected in Configure()).
 	if identity == nil || git == nil {
 		c := collectors.NewCollector(collectors.DefaultCollectConfig())
 		result := c.Collect(ctx)
@@ -234,4 +304,16 @@ func fireCloseEvent(ctx context.Context, obs observer.Client, runID string, stat
 	if patchErr != nil {
 		fmt.Fprintf(os.Stderr, "manifestit: PATCH /closed failed: %v\n", patchErr)
 	}
+}
+
+// --------------------------------------------------------------------------
+// watcherStatePath / buildObserverFromState
+// --------------------------------------------------------------------------
+
+func watcherStatePath(ppid int) string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("manifestit-watcher-%d.json", ppid))
+}
+
+func buildObserverFromState(state ClosureState) (observer.Client, error) {
+	return buildProviderClient(state.APIKey, state.BaseURL, state.OrgID, state.OrgKey)
 }

@@ -83,9 +83,10 @@ rm -rf .terraform .terraform.lock.hcl
 info "Running terraform apply..."
 TF_CLI_CONFIG_FILE="$TERRAFORMRC" terraform apply -auto-approve
 
-# Give the watcher subprocess up to 10 s to detect terraform has exited
-# and fire the closed event before we query the mock server.
-info "Waiting for watcher to fire closed event (up to 10 s)..."
+# Give the PPID watcher goroutine up to 10 s to detect that terraform has
+# exited and fire the closed event. The watcher polls every 2s, so the close
+# event should arrive within 2-4s of terraform apply returning.
+info "Waiting for PPID watcher to fire closed event (up to 10 s)..."
 CLOSED_SEEN=false
 for i in $(seq 1 20); do
   EVENTS=$(curl -sf "http://localhost:$MOCK_PORT/dump")
