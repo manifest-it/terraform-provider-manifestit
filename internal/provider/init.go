@@ -8,12 +8,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
 	"terraform-provider-manifestit/internal/collectors"
 	resource2 "terraform-provider-manifestit/internal/resource"
 	"terraform-provider-manifestit/pkg/sdk/providers"
 	"terraform-provider-manifestit/pkg/sdk/providers/observer"
 	"terraform-provider-manifestit/pkg/utils"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -29,19 +30,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// heartbeatCancel holds the cancel func for the running heartbeat goroutine.
-// Set once inside providerRunOnce; read by RunCleanup.
-var heartbeatCancel context.CancelFunc
-
-var (
-	_ provider.Provider = &Provider{}
-)
+var _ provider.Provider = &Provider{}
 
 type Provider struct {
-	HttpClient *http.Client
-	Client     *providers.ProviderClient
-
-	ConfigureCallbackFunc func(p *Provider, request *provider.ConfigureRequest, config *Schema) diag.Diagnostics
+	HttpClient            *http.Client
+	Client                *providers.ProviderClient
+	ConfigureCallbackFunc func(p *Provider, req *provider.ConfigureRequest, config *Schema) diag.Diagnostics
 	Now                   func() time.Time
 	DefaultTags           map[string]string
 }
@@ -61,179 +55,119 @@ type Schema struct {
 }
 
 func New() provider.Provider {
-	return &Provider{
-		ConfigureCallbackFunc: defaultConfigureFunc,
-	}
+	return &Provider{ConfigureCallbackFunc: defaultConfigureFunc}
 }
 
 func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{
-		resource2.NewObserver,
+	return []func() resource.Resource{resource2.NewObserver}
+}
+
+func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource { return nil }
+
+func (p *Provider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+	resp.TypeName = "manifestit"
+}
+
+func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Attributes: map[string]schema.Attribute{
+			"api_key":                       schema.StringAttribute{Optional: true, Sensitive: true, Description: "ManifestIT API key. Can also be set via MIT_API_KEY."},
+			"api_url":                       schema.StringAttribute{Required: true, Description: "ManifestIT API endpoint URL."},
+			"validate":                      schema.StringAttribute{Required: true, Description: "Validate API key on init. Valid values: true, false."},
+			"org_id":                        schema.Int32Attribute{Required: true, Description: "Organization ID."},
+			"tracked_branch":                schema.StringAttribute{Required: true, Description: "Branch to track for compliance (e.g. 'main')."},
+			"tracked_repo":                  schema.StringAttribute{Required: true, Description: "Git repository URL to track."},
+			"provider_configuration_id":     schema.Int32Attribute{Required: true, Description: "Provider configuration ID."},
+			"org_key":                       schema.StringAttribute{Required: true, Sensitive: true, Description: "Organization key."},
+			"provider_id":                   schema.Int32Attribute{Required: true, Description: "Provider ID."},
+			"http_client_retry_enabled":     schema.StringAttribute{Optional: true, Description: "Enable HTTP retries on 429/5xx. Valid values: true, false. Defaults to true."},
+			"http_client_retry_max_retries": schema.Int64Attribute{Optional: true, Description: "Max HTTP retry count (1–5). Defaults to 3."},
+		},
 	}
 }
 
-func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequest, response *provider.ConfigureResponse) {
+func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var config Schema
-	response.Diagnostics.Append(request.Config.Get(ctx, &config)...)
-	if response.Diagnostics.HasError() {
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	diags := p.ConfigureConfigDefaults(ctx, &config)
-	if diags.HasError() {
-		response.Diagnostics.Append(diags...)
+	if diags := p.applyConfigDefaults(&config); diags.HasError() {
+		resp.Diagnostics.Append(diags...)
 	}
 
-	response.Diagnostics.Append(p.ConfigureCallbackFunc(p, &request, &config)...)
-	if response.Diagnostics.HasError() {
+	resp.Diagnostics.Append(p.ConfigureCallbackFunc(p, &req, &config)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	response.DataSourceData = p.Client
-	response.ResourceData = p.Client
-	response.Diagnostics.Append(p.postObserverData(ctx, &config)...)
+	resp.DataSourceData = p.Client
+	resp.ResourceData = p.Client
+	resp.Diagnostics.Append(p.startLifecycle(ctx, &config)...)
 }
 
-func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Schema) diag.Diagnostics {
+func (p *Provider) applyConfigDefaults(config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	if config.ApiKey.IsNull() {
 		apiKey, err := utils.GetMultiEnvVar(utils.MITAPIKey)
 		if err != nil {
-			diags.AddError("Missing API Key", "api_key must be set in the provider block or via the MIT_API_KEY environment variable.")
+			diags.AddError("Missing API Key", "api_key must be set in the provider block or via MIT_API_KEY.")
 			return diags
 		}
 		config.ApiKey = types.StringValue(apiKey)
 	}
 
 	if config.HttpClientRetryMaxRetries.IsNull() {
-		rTimeout, err := utils.GetMultiEnvVar(utils.MITHTTPRetryMaxRetries)
-		if err == nil {
-			v, _ := strconv.Atoi(rTimeout)
-			config.HttpClientRetryMaxRetries = types.Int64Value(int64(v))
+		if v, err := utils.GetMultiEnvVar(utils.MITHTTPRetryMaxRetries); err == nil {
+			if n, err := strconv.Atoi(v); err == nil {
+				config.HttpClientRetryMaxRetries = types.Int64Value(int64(n))
+			}
 		}
 	}
 
 	if config.HttpClientRetryEnabled.IsNull() {
-		rEnabled, err := utils.GetMultiEnvVar(utils.MITHTTPRetryEnabled)
-		if err == nil {
-			config.HttpClientRetryEnabled = types.StringValue(rEnabled)
+		if v, err := utils.GetMultiEnvVar(utils.MITHTTPRetryEnabled); err == nil {
+			config.HttpClientRetryEnabled = types.StringValue(v)
 		} else {
 			config.HttpClientRetryEnabled = types.StringValue("true")
 		}
 	}
 
-	diags.Append(p.ValidateConfigValues(ctx, config)...)
-
+	diags.Append(p.validateConfig(config)...)
 	return diags
 }
 
-func (p *Provider) ValidateConfigValues(ctx context.Context, config *Schema) diag.Diagnostics {
+func (p *Provider) validateConfig(config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
-	oneOfStringValidator := stringvalidator.OneOf("true", "false")
-	int64BetweenValidator := int64validator.Between(1, 5)
+	strValidator := stringvalidator.OneOf("true", "false")
+	intValidator := int64validator.Between(1, 5)
 
 	if !config.Validate.IsNull() {
 		res := validator.StringResponse{}
-		oneOfStringValidator.ValidateString(ctx, validator.StringRequest{ConfigValue: config.Validate}, &res)
+		strValidator.ValidateString(context.Background(), validator.StringRequest{ConfigValue: config.Validate}, &res)
 		diags.Append(res.Diagnostics...)
 	}
-
 	if !config.HttpClientRetryEnabled.IsNull() {
 		res := validator.StringResponse{}
-		oneOfStringValidator.ValidateString(ctx, validator.StringRequest{ConfigValue: config.HttpClientRetryEnabled}, &res)
+		strValidator.ValidateString(context.Background(), validator.StringRequest{ConfigValue: config.HttpClientRetryEnabled}, &res)
 		diags.Append(res.Diagnostics...)
 	}
-
 	if !config.HttpClientRetryMaxRetries.IsNull() {
 		res := validator.Int64Response{}
-		int64BetweenValidator.ValidateInt64(ctx, validator.Int64Request{ConfigValue: config.HttpClientRetryMaxRetries}, &res)
+		intValidator.ValidateInt64(context.Background(), validator.Int64Request{ConfigValue: config.HttpClientRetryMaxRetries}, &res)
 		diags.Append(res.Diagnostics...)
 	}
-
 	return diags
 }
 
-func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return nil
-}
-
-func (p *Provider) Metadata(_ context.Context, _ provider.MetadataRequest, response *provider.MetadataResponse) {
-	response.TypeName = "manifestit"
-}
-
-func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
-	resp.Schema = schema.Schema{
-		Attributes: map[string]schema.Attribute{
-			"api_key": schema.StringAttribute{
-				Optional:    true,
-				Sensitive:   true,
-				Description: "ManifestIT API key. Can also be set via the MIT_API_KEY environment variable.",
-			},
-			"api_url": schema.StringAttribute{
-				Required:    true,
-				Description: "The ManifestIT API endpoint URL.",
-			},
-			"validate": schema.StringAttribute{
-				Required:    true,
-				Description: "Enables validation of the provided API key during provider initialization. Valid values are [`true`, `false`].",
-			},
-			"org_id": schema.Int32Attribute{
-				Required:    true,
-				Description: "The organization ID.",
-			},
-			"tracked_branch": schema.StringAttribute{
-				Required:    true,
-				Description: "The primary branch to track for compliance (e.g., 'main'). The provider checks whether the current code has been merged to this branch.",
-			},
-			"tracked_repo": schema.StringAttribute{
-				Required:    true,
-				Description: "The Git repository URL to track (e.g., 'https://github.com/org/infra'). Used to identify which repository this Terraform workspace belongs to.",
-			},
-			"provider_configuration_id": schema.Int32Attribute{
-				Required:    true,
-				Description: "The provider configuration ID.",
-			},
-			"org_key": schema.StringAttribute{
-				Required:    true,
-				Sensitive:   true,
-				Description: "The organization key.",
-			},
-			"provider_id": schema.Int32Attribute{
-				Required:    true,
-				Description: "The provider ID.",
-			},
-			"http_client_retry_enabled": schema.StringAttribute{
-				Optional:    true,
-				Description: "Enables request retries on HTTP status codes 429 and 5xx. Valid values are [`true`, `false`]. Defaults to `true`.",
-			},
-			"http_client_retry_max_retries": schema.Int64Attribute{
-				Optional:    true,
-				Description: "The HTTP request maximum retry number. Defaults to 3.",
-			},
-		},
-	}
-}
-
-func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, config *Schema) diag.Diagnostics {
+func defaultConfigureFunc(p *Provider, _ *provider.ConfigureRequest, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
-
-	debug := os.Getenv("DEBUG") == "true"
-	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
 
 	maxRetries := 3
 	if !config.HttpClientRetryMaxRetries.IsNull() {
 		maxRetries = int(config.HttpClientRetryMaxRetries.ValueInt64())
-	}
-
-	providerConfigID := ""
-	if !config.ProviderConfigurationId.IsNull() {
-		providerConfigID = strconv.FormatInt(int64(config.ProviderConfigurationId.ValueInt32()), 10)
-	}
-
-	providerID := ""
-	if !config.ProviderId.IsNull() {
-		providerID = strconv.FormatInt(int64(config.ProviderId.ValueInt32()), 10)
 	}
 
 	client, err := providers.NewProviderClient(providers.Config{
@@ -241,11 +175,11 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 		BaseURL:                 config.ApiUrl.ValueString(),
 		OrgID:                   strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10),
 		OrgKey:                  config.OrgKey.ValueString(),
-		ProviderID:              providerID,
-		ProviderConfigurationID: providerConfigID,
+		ProviderID:              int32ToString(config.ProviderId),
+		ProviderConfigurationID: int32ToString(config.ProviderConfigurationId),
 		HTTPClient:              p.HttpClient,
-		Debug:                   debug,
-		Logger:                  logger,
+		Debug:                   os.Getenv("DEBUG") == "true",
+		Logger:                  zerolog.New(os.Stderr).With().Timestamp().Logger(),
 		MaxRetries:              maxRetries,
 	})
 	if err != nil {
@@ -257,18 +191,15 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 	return diags
 }
 
-// buildProviderClient creates a minimal ProviderClient with an observer.Client.
-// Used by the watcher subprocess (MIT_WATCHER_MODE=1) via buildObserverFromState.
+// buildProviderClient creates a minimal observer client for the watcher subprocess.
 func buildProviderClient(apiKey, baseURL, orgID, orgKey string) (observer.Client, error) {
-	debug := os.Getenv("DEBUG") == "true"
-	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
 	client, err := providers.NewProviderClient(providers.Config{
 		APIKey:     apiKey,
 		BaseURL:    baseURL,
 		OrgID:      orgID,
 		OrgKey:     orgKey,
-		Debug:      debug,
-		Logger:     logger,
+		Debug:      os.Getenv("DEBUG") == "true",
+		Logger:     zerolog.New(os.Stderr).With().Timestamp().Logger(),
 		MaxRetries: 3,
 	})
 	if err != nil {
@@ -277,73 +208,45 @@ func buildProviderClient(apiKey, baseURL, orgID, orgKey string) (observer.Client
 	return client.Observer, nil
 }
 
-func (p *Provider) postObserverData(ctx context.Context, config *Schema) diag.Diagnostics {
+// startLifecycle is called from Configure(). Fires POST /open, spawns the
+// watcher subprocess, and registers the SIGTERM handler. Guards via
+// providerRunOnce so it runs at most once per process lifetime.
+func (p *Provider) startLifecycle(ctx context.Context, config *Schema) diag.Diagnostics {
 	var diags diag.Diagnostics
+
 	operation := detectTerraformOperation()
-	providerLog("detected operation=%s pid=%d ppid=%d", operation, os.Getpid(), os.Getppid())
+	providerLog("operation=%s pid=%d ppid=%d", operation, os.Getpid(), os.Getppid())
 
 	if operation != "apply" && operation != "destroy" {
-		providerLog("skipping lifecycle — operation is not apply/destroy")
-		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
+		tflog.Debug(ctx, "manifestit: skipping lifecycle", map[string]interface{}{"operation": operation})
 		return diags
 	}
 
-	// providerRunOnce ensures the full open/heartbeat/close lifecycle starts
-	// at most once per process, even when Configure() is called multiple times
-	// (e.g. aliased provider blocks). The second call is a complete no-op.
 	providerRunOnce.Do(func() {
-		diags = p.startObserverLifecycle(ctx, config, operation)
+		diags = p.runLifecycle(ctx, config, operation)
 	})
-
 	return diags
 }
 
-// startObserverLifecycle acquires the lock, POSTs /open, starts the heartbeat,
-// registers the SIGTERM handler, and registers the RunCleanup close path.
-// It is called at most once per process via providerRunOnce.Do.
-func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, operation string) diag.Diagnostics {
+func (p *Provider) runLifecycle(ctx context.Context, config *Schema, operation string) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	runID, lockPath, alreadyPosted := acquireRunLock()
 	if alreadyPosted {
-		providerLog("lock already held — skipping lifecycle (another instance owns this run)")
+		providerLog("lock held — skipping (another instance owns this run)")
 		return diags
 	}
-	providerLog("lifecycle start  operation=%s run_id=%s pid=%d ppid=%d",
-		operation, runID, os.Getpid(), os.Getppid())
+	providerLog("lifecycle start run_id=%s pid=%d ppid=%d", runID, os.Getpid(), os.Getppid())
 
-	orgID := ""
-	if !config.OrgId.IsNull() {
-		orgID = strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
-	}
-	trackedBranch := ""
-	if !config.TrackedBranch.IsNull() {
-		trackedBranch = config.TrackedBranch.ValueString()
-	}
-	trackedRepo := ""
-	if !config.TrackedRepo.IsNull() {
-		trackedRepo = config.TrackedRepo.ValueString()
-	}
-	providerConfigID := ""
-	if !config.ProviderConfigurationId.IsNull() {
-		providerConfigID = strconv.FormatInt(int64(config.ProviderConfigurationId.ValueInt32()), 10)
-	}
-	providerID := ""
-	if !config.ProviderId.IsNull() {
-		providerID = strconv.FormatInt(int64(config.ProviderId.ValueInt32()), 10)
-	}
+	orgID := strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
 
 	c := collectors.NewCollector(collectors.DefaultCollectConfig())
-	c.TrackedBranch = trackedBranch
-	c.TrackedRepo = trackedRepo
+	c.TrackedBranch = config.TrackedBranch.ValueString()
+	c.TrackedRepo = config.TrackedRepo.ValueString()
 	collectCtx, collectCancel := context.WithTimeout(ctx, 8*time.Second)
 	result := c.Collect(collectCtx)
 	collectCancel()
-	providerLog("identity/git collected  identity_type=%s git_available=%v",
-		result.Identity.Type, result.Git.Available)
 
-	// POST /open
-	providerLog("POST /open  run_id=%s base_url=%s", runID, config.ApiUrl.ValueString())
 	_, postErr := p.Client.Observer.Post(ctx, observer.ObserverPayload{
 		RunID:       runID,
 		Status:      "open",
@@ -352,14 +255,14 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		OrgID:       orgID,
 	})
 	if postErr != nil {
-		providerLog("POST /open FAILED: %v — removing lock", postErr)
-		_ = os.Remove(lockPath)
-		diags.AddWarning("ManifestIT observer open event failed", postErr.Error())
+		providerLog("POST /open FAILED: %v", postErr)
+		os.Remove(lockPath)
+		diags.AddWarning("ManifestIT open event failed", postErr.Error())
 		return diags
 	}
-	providerLog("POST /open OK")
+	providerLog("POST /open OK run_id=%s", runID)
 
-	state := ClosureState{
+	state := runState{
 		RunID:    runID,
 		Action:   operation,
 		APIKey:   config.ApiKey.ValueString(),
@@ -371,65 +274,43 @@ func (p *Provider) startObserverLifecycle(ctx context.Context, config *Schema, o
 		Identity: result.Identity,
 		Git:      result.Git,
 	}
-	_ = providerConfigID
-	_ = providerID
 
-	obs := p.Client.Observer
-	hbCtx, cancel := context.WithCancel(context.Background())
-	heartbeatCancel = cancel
-
-	startHeartbeat(hbCtx, obs, runID)
-	providerLog("heartbeat goroutine started  interval=%s", HeartbeatInterval)
-
-	registerSIGTERMHandler(hbCtx, cancel, obs, runID, state)
+	_, cancel := context.WithCancel(context.Background())
+	registerSIGTERMHandler(cancel, p.Client.Observer, runID, state)
 	providerLog("SIGTERM handler registered")
 
-	// Spawn watcher subprocess — PRIMARY close path
-	statePath, writeErr := writeClosureState(state)
-	if writeErr != nil {
-		providerLog("watcher state write FAILED: %v", writeErr)
-		tflog.Warn(ctx, "ManifestIT: failed to write watcher state — closed event may not fire",
-			map[string]interface{}{"error": writeErr.Error()})
-		diags.AddWarning("ManifestIT watcher state write failed", writeErr.Error())
-	} else if spawnErr := spawnWatcher(statePath); spawnErr != nil {
-		providerLog("watcher spawn FAILED: %v", spawnErr)
-		os.Remove(statePath)
-		tflog.Warn(ctx, "ManifestIT: failed to spawn watcher — closed event may not fire",
-			map[string]interface{}{"error": spawnErr.Error()})
-		diags.AddWarning("ManifestIT watcher spawn failed", spawnErr.Error())
-	} else {
-		providerLog("watcher subprocess spawned  state=%s ppid=%d", statePath, os.Getppid())
+	statePath, err := writeRunState(state)
+	if err != nil {
+		providerLog("watcher state write FAILED: %v", err)
+		diags.AddWarning("ManifestIT watcher state write failed", err.Error())
+		return diags
 	}
-
-	RegisterCleanup(func() {
-		cancel() // stop heartbeat goroutine — watcher subprocess owns PATCH /closed
-	})
-	providerLog("lifecycle setup complete — watcher will fire PATCH /closed when PPID exits")
-
-	tflog.Debug(ctx, "ManifestIT observer lifecycle started",
-		map[string]interface{}{"run_id": runID, "operation": operation})
-
+	if err := spawnWatcher(statePath); err != nil {
+		providerLog("watcher spawn FAILED: %v", err)
+		os.Remove(statePath)
+		diags.AddWarning("ManifestIT watcher spawn failed", err.Error())
+		return diags
+	}
+	providerLog("watcher spawned ppid=%d", os.Getppid())
 	return diags
 }
 
-// generateRunID generates a random UUID v4 using github.com/google/uuid.
-func generateRunID() string {
-	return uuid.New().String()
+func int32ToString(v types.Int32) string {
+	if v.IsNull() {
+		return ""
+	}
+	return strconv.FormatInt(int64(v.ValueInt32()), 10)
 }
 
-// detectTerraformOperation reads the parent process command line to determine
-// the terraform subcommand (apply, destroy, plan, etc.).
 func detectTerraformOperation() string {
 	if os.Getenv("TF_REATTACH_PROVIDERS") != "" {
 		return "apply"
 	}
-
 	ppid := os.Getppid()
 	cmdLine, err := getParentCommandLine(ppid)
 	if err != nil {
 		return "unknown"
 	}
-
 	for _, op := range []string{"apply", "destroy", "import", "refresh", "plan"} {
 		if strings.Contains(cmdLine, op) {
 			return op
@@ -443,87 +324,65 @@ func getParentCommandLine(pid int) (string, error) {
 }
 
 func observerLockPath() string {
-	ppid := os.Getppid()
-	return filepath.Join(os.TempDir(), fmt.Sprintf("manifestit-observer-%d.lock", ppid))
+	dir := stateDir()
+	_ = os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, fmt.Sprintf("observer-%d.lock", os.Getppid()))
 }
 
-// acquireRunLock atomically creates the per-PPID lock file and returns:
-//   - runID       – a newly generated UUID v4 for this terraform run
-//   - lockPath    – the path of the lock file written
-//   - alreadyPosted – true if another Configure() call for the same terraform
-//     invocation already acquired the lock (idempotency guard)
-//
-// Atomicity: uses os.Link (hard link) for the creation step. link(2) is atomic
-// on POSIX and fails with EEXIST when the target already exists, so exactly one
-// concurrent caller wins per lock-creation attempt.
-//
-// Stale locks (owner PID no longer alive) are reclaimed via remove + re-link,
-// with a read-back verify to detect the rare case where two callers both removed
-// the stale lock and raced to re-link.
-func acquireRunLock() (runID string, lockPath string, alreadyPosted bool) {
+// acquireRunLock atomically creates a per-PPID lock file using os.Link.
+// Returns alreadyPosted=true if another plugin instance for the same terraform
+// run already owns the lock.
+func acquireRunLock() (runID, lockPath string, alreadyPosted bool) {
 	lockPath = observerLockPath()
 	runID = generateRunID()
 
 	ppid := os.Getppid()
-	ppidS := strconv.Itoa(ppid)
-	content := ppidS + ":" + runID
+	content := fmt.Sprintf("%d:%s", ppid, runID)
 	dir := filepath.Dir(lockPath)
 
-	providerLog("acquireRunLock: lockPath=%s pid=%d ppid=%d", lockPath, os.Getpid(), ppid)
-
-	tmp, tmpErr := os.CreateTemp(dir, ".lock-tmp-")
-	if tmpErr != nil {
-		providerLog("acquireRunLock: CreateTemp failed: %v → alreadyPosted=true", tmpErr)
+	tmp, err := os.CreateTemp(dir, ".lock-tmp-")
+	if err != nil {
 		return "", lockPath, true
 	}
 	tmpPath := tmp.Name()
-	_, _ = tmp.WriteString(content)
-	_ = tmp.Close()
+	fmt.Fprint(tmp, content)
+	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	if linkErr := os.Link(tmpPath, lockPath); linkErr == nil {
-		providerLog("acquireRunLock: os.Link succeeded — we own the lock (new owner)")
+	if err := os.Link(tmpPath, lockPath); err == nil {
 		return runID, lockPath, false
-	} else {
-		providerLog("acquireRunLock: os.Link failed (%v) — lock exists, checking owner", linkErr)
 	}
 
-	data, readErr := os.ReadFile(lockPath)
-	if readErr != nil {
-		providerLog("acquireRunLock: lock disappeared after failed Link (%v) → alreadyPosted=true", readErr)
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
 		return "", lockPath, true
 	}
-	providerLog("acquireRunLock: lock content=%q", strings.TrimSpace(string(data)))
 	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
 	if len(parts) < 1 {
-		providerLog("acquireRunLock: bad lock content → alreadyPosted=true")
 		return "", lockPath, true
 	}
-	ownerPPID, parseErr := strconv.Atoi(parts[0])
-	if parseErr != nil {
-		providerLog("acquireRunLock: cannot parse ownerPPID from %q → alreadyPosted=true", parts[0])
+	ownerPPID, err := strconv.Atoi(parts[0])
+	if err != nil {
 		return "", lockPath, true
 	}
-	alive := processExists(ownerPPID)
-	providerLog("acquireRunLock: ownerPPID=%d alive=%v", ownerPPID, alive)
-	if alive {
+	if processExists(ownerPPID) {
 		return "", lockPath, true
 	}
 
-	// Stale lock — owner PPID is dead
-	providerLog("acquireRunLock: stale lock (ownerPPID=%d dead) — reclaiming", ownerPPID)
-	_ = os.Remove(lockPath)
-	if linkErr := os.Link(tmpPath, lockPath); linkErr != nil {
-		providerLog("acquireRunLock: re-link after stale remove failed (%v) → alreadyPosted=true", linkErr)
+	// Stale lock from a dead terraform run — reclaim.
+	os.Remove(lockPath)
+	if err := os.Link(tmpPath, lockPath); err != nil {
 		return "", lockPath, true
 	}
-	check, checkErr := os.ReadFile(lockPath)
-	if checkErr != nil || strings.TrimSpace(string(check)) != content {
-		providerLog("acquireRunLock: verify after re-link failed → alreadyPosted=true")
+	check, err := os.ReadFile(lockPath)
+	if err != nil || strings.TrimSpace(string(check)) != content {
 		return "", lockPath, true
 	}
-	providerLog("acquireRunLock: stale lock reclaimed — we own the lock")
 	return runID, lockPath, false
+}
+
+func generateRunID() string {
+	return uuid.New().String()
 }
 
 func processExists(pid int) bool {

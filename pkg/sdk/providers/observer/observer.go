@@ -11,39 +11,19 @@ import (
 	sdkErrors "terraform-provider-manifestit/pkg/sdk/errors"
 )
 
-// Timing and retry constants for all observer API calls.
 const (
-	// HeartbeatDeadline is the per-call HTTP timeout for heartbeat requests.
-	HeartbeatDeadline = 10 * time.Second
-	// HeartbeatMaxRetries is the number of retries for heartbeat calls.
-	// Heartbeats are frequent so only 2 retries are used with a fixed delay.
-	HeartbeatMaxRetries = 2
-	// HeartbeatRetryDelay is the fixed retry delay for heartbeat calls.
-	HeartbeatRetryDelay = 200 * time.Millisecond
-
-	// PostOpenMaxRetries is the number of retries for POST /open.
 	PostOpenMaxRetries = 3
-	// PostOpenRetryBase is the base for exponential backoff on POST /open.
-	PostOpenRetryBase = 500 * time.Millisecond
-	// PostOpenRetryMax caps exponential backoff.
-	PostOpenRetryMax = 5 * time.Second
-
-	// CloseDeadline is the per-call HTTP timeout for PATCH /closed.
-	CloseDeadline = 25 * time.Second
+	PostOpenRetryBase  = 500 * time.Millisecond
+	PostOpenRetryMax   = 5 * time.Second
+	CloseDeadline      = 25 * time.Second
 )
 
-// Client defines the interface for observer API operations.
+// Client defines the observer API operations.
 type Client interface {
-	// Post publishes an "open" event at the start of a terraform run.
-	// Retries up to PostOpenMaxRetries times with exponential backoff.
+	// Post publishes an "open" event at apply start. Retries with exponential backoff.
 	Post(ctx context.Context, input ObserverPayload) (*ObserverResponse, error)
-	// Patch publishes a "closed" or "heartbeat" event.
-	// Returns nil on 409/410 (already closed — idempotent).
+	// Patch publishes a "closed" event. Returns nil on 409/410 (idempotent).
 	Patch(ctx context.Context, runID string, input ClosePayload) (*ObserverResponse, error)
-	// Heartbeat sends a heartbeat PATCH to keep the event alive on the server.
-	// Creates its own context with HeartbeatDeadline independent of the caller's context.
-	// Non-fatal: returns error on exhaustion but never panics.
-	Heartbeat(ctx context.Context, runID string) error
 }
 
 // ObserverPayload is the payload posted to open a run observation.
@@ -180,43 +160,6 @@ func (c *client) Patch(ctx context.Context, runID string, input ClosePayload) (*
 	}
 
 	return nil, fmt.Errorf("observer patch failed after %d retries: %w", PatchMaxRetries, lastErr)
-}
-
-// Heartbeat sends a { "status": "heartbeat" } PATCH to keep the server event
-// alive. It always creates its own independent context with HeartbeatDeadline
-// so a cancelled parent context does not prevent the call from running.
-// Retries twice with a fixed HeartbeatRetryDelay before returning an error.
-func (c *client) Heartbeat(_ context.Context, runID string) error {
-	payload := ClosePayload{Status: "heartbeat"}
-
-	var lastErr error
-	for attempt := 0; attempt <= HeartbeatMaxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(HeartbeatRetryDelay)
-		}
-
-		// Use an independent context — caller cancellation must not block heartbeat.
-		hbCtx, cancel := context.WithTimeout(context.Background(), HeartbeatDeadline)
-		body, status, err := c.api.Patch(hbCtx, basePath+"/"+runID, payload)
-		cancel()
-
-		// 409/410: event already closed — heartbeat is a no-op, not an error.
-		// Check status first (HTTPExecutor returns both status and error for 4xx).
-		if status == http.StatusConflict || status == http.StatusGone {
-			return nil
-		}
-		if err != nil {
-			lastErr = fmt.Errorf("heartbeat patch failed: %w", err)
-			continue
-		}
-		if hErr := sdkErrors.Handle(status, body); hErr != nil {
-			lastErr = hErr
-			continue
-		}
-		return nil
-	}
-
-	return fmt.Errorf("heartbeat failed after %d retries: %w", HeartbeatMaxRetries, lastErr)
 }
 
 // isTransient returns true for HTTP status codes that warrant a retry.

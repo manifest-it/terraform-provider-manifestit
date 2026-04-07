@@ -20,8 +20,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	ctx := context.Background()
-
 	var debugMode bool
 
 	flag.BoolVar(&debugMode, "debug", false, "set to true to run the provider with support for debuggers like delve")
@@ -29,11 +27,11 @@ func main() {
 
 	var serveOpts providerserver.ServeOpts
 
+	serveOpts.Address = "registry.terraform.io/manifest-it/manifestit"
+
 	if debugMode {
 		serveOpts.Debug = true
 	}
-
-	serveOpts.Address = "registry.terraform.io/manifest-it/manifestit"
 
 	// providerserver.Serve blocks for the entire terraform run.
 	// When it returns (gRPC connection closed by terraform — normal completion,
@@ -44,14 +42,10 @@ func main() {
 	// returns and RunCleanup() is never called. The server will mark the event
 	// "timed_out" after the ServerTimeoutWindow (60s) — this is acceptable.
 	err := providerserver.Serve(
-		ctx,
+		context.Background(),
 		provider.New,
 		serveOpts,
 	)
-
-	// Fire the close event on normal/clean exit. This is a no-op if SIGTERM
-	// already fired the close event (providerCloseOnce guards against double-fire).
-	provider.RunCleanup()
 
 	if err != nil {
 		log.Fatal(err)

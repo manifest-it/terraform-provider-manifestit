@@ -12,10 +12,6 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.0"
     }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
   }
 }
 
@@ -31,24 +27,21 @@ provider "manifestit" {
   validate                  = "false"
 }
 
-# Simulates slow resources (AWS S3, EC2, RDS etc.) running in parallel.
-# 10s sleep — closed event must NOT fire before this completes.
-resource "null_resource" "heartbeat_test_delay" {
+# Simulates a slow resource (AWS S3, EC2, RDS etc.) taking 10s.
+# Proves PATCH /closed does NOT fire before this completes.
+resource "null_resource" "slow_resource" {
   triggers = {
-    run = "test-1"
+    run = timestamp()
   }
   provisioner "local-exec" {
-    command = "echo 'Simulating slow resource (10s)...' && sleep 10 && echo 'Slow resource done'"
+    command = "echo 'Slow resource started...' && sleep 10 && echo 'Slow resource done'"
   }
 }
 
-resource "random_id" "bucket_suffix" {
-  byte_length = 8
-}
-
-# NO depends_on — watcher subprocess fires close after terraform fully exits
+# No depends_on needed — PATCH /closed fires when terraform (PPID) exits,
+# which only happens after ALL providers finish.
 resource "manifestit_observer" "this" {}
 
 output "test_summary" {
-  value = "Apply complete. Check localhost:3000 for open+closed events."
+  value = "Apply complete. Check localhost:8080 for open+closed events."
 }

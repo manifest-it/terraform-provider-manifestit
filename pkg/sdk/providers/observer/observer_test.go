@@ -340,12 +340,7 @@ func TestObserverPayload_OmitEmptyIdentityGit(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Heartbeat — new tests
-// ---------------------------------------------------------------------------
-
-// newTestClientNoRetry creates a client with MaxRetries=0 so tests control
-// retries at the observer layer independently of the HTTPExecutor.
+// newTestClientNoRetry creates a client with executor-level retries disabled.
 func newTestClientNoRetry(t *testing.T, handler http.HandlerFunc) (observer.Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -356,7 +351,7 @@ func newTestClientNoRetry(t *testing.T, handler http.HandlerFunc) (observer.Clie
 		Client:     srv.Client(),
 		Auth:       noAuth,
 		Logger:     zerolog.Nop(),
-		MaxRetries: 0, // disable executor-level retries so observer controls them
+		MaxRetries: 0,
 	})
 	api := sdk.NewAPIClient(sdk.APIClientConfig{
 		Executor: executor,
@@ -364,103 +359,6 @@ func newTestClientNoRetry(t *testing.T, handler http.HandlerFunc) (observer.Clie
 		Logger:   zerolog.Nop(),
 	})
 	return observer.New(api), srv
-}
-
-func TestHeartbeat_success(t *testing.T) {
-	const wantRunID = "hb-run-001"
-	var capturedBody []byte
-	var capturedPath string
-
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		capturedPath = r.URL.Path
-		capturedBody, _ = io.ReadAll(r.Body)
-		respondJSON(w, http.StatusOK, observer.ObserverResponse{ID: wantRunID, Status: "heartbeat"})
-	})
-
-	if err := client.Heartbeat(context.Background(), wantRunID); err != nil {
-		t.Fatalf("Heartbeat returned error: %v", err)
-	}
-
-	if !strings.HasSuffix(capturedPath, "/api/v1/events/"+wantRunID) {
-		t.Errorf("path: got %q, expected suffix /api/v1/events/%s", capturedPath, wantRunID)
-	}
-
-	var body map[string]any
-	_ = json.Unmarshal(capturedBody, &body)
-	if status, _ := body["status"].(string); status != "heartbeat" {
-		t.Errorf("body status: got %q want heartbeat", status)
-	}
-}
-
-func TestHeartbeat_retriesTwiceOnError(t *testing.T) {
-	var attempts int32
-
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		n := atomic.AddInt32(&attempts, 1)
-		if n <= 2 {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		respondJSON(w, http.StatusOK, observer.ObserverResponse{Status: "heartbeat"})
-	})
-
-	if err := client.Heartbeat(context.Background(), "hb-retry"); err != nil {
-		t.Fatalf("expected success after retries, got: %v", err)
-	}
-	if got := atomic.LoadInt32(&attempts); got != 3 {
-		t.Errorf("expected 3 attempts (2 failures + 1 success), got %d", got)
-	}
-}
-
-func TestHeartbeat_nonFatalAfterExhaustion(t *testing.T) {
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-
-	err := client.Heartbeat(context.Background(), "hb-exhaust")
-	if err == nil {
-		t.Fatal("expected non-nil error after all retries exhausted")
-	}
-	// Must not panic — error returned is non-nil but the test just logs it.
-}
-
-func TestHeartbeat_respectsDeadline(t *testing.T) {
-	// Server delays 15s — heartbeat has a 10s deadline, so it should return fast.
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(15 * time.Second)
-		respondJSON(w, http.StatusOK, observer.ObserverResponse{})
-	})
-
-	start := time.Now()
-	_ = client.Heartbeat(context.Background(), "hb-deadline")
-	elapsed := time.Since(start)
-
-	// HeartbeatDeadline is 10s; allow 1s tolerance per retry (max 2 retries = 30s limit).
-	// In practice the deadline context should cut it off well within 11s per attempt.
-	maxAllowed := observer.HeartbeatDeadline*time.Duration(observer.HeartbeatMaxRetries+1) + 500*time.Millisecond
-	if elapsed > maxAllowed {
-		t.Errorf("Heartbeat took %v, expected < %v", elapsed, maxAllowed)
-	}
-}
-
-func TestHeartbeat_idempotentOn409(t *testing.T) {
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusConflict) // 409
-	})
-
-	if err := client.Heartbeat(context.Background(), "hb-409"); err != nil {
-		t.Errorf("expected nil for 409, got: %v", err)
-	}
-}
-
-func TestHeartbeat_idempotentOn410(t *testing.T) {
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusGone) // 410
-	})
-
-	if err := client.Heartbeat(context.Background(), "hb-410"); err != nil {
-		t.Errorf("expected nil for 410, got: %v", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -596,10 +494,7 @@ func TestPost_exponentialBackoff(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestObserver_runIDInURL
-// ---------------------------------------------------------------------------
-
+// TestObserver_runIDInURL verifies run_id appears in the PATCH URL path.
 func TestObserver_runIDInURL(t *testing.T) {
 	paths := make([]string, 0, 3)
 	ids := []string{"alpha", "beta", "gamma"}
@@ -610,41 +505,12 @@ func TestObserver_runIDInURL(t *testing.T) {
 	})
 
 	for _, id := range ids {
-		_ = client.Heartbeat(context.Background(), id)
+		_, _ = client.Patch(context.Background(), id, observer.ClosePayload{Status: "closed"})
 	}
 
 	for i, p := range paths {
 		if !strings.HasSuffix(p, "/"+ids[i]) {
 			t.Errorf("path[%d] = %q, expected suffix /%s", i, p, ids[i])
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestObserver_heartbeatDoesNotShareContextWithClose
-// ---------------------------------------------------------------------------
-
-func TestObserver_heartbeatDoesNotShareContextWithClose(t *testing.T) {
-	// The cancelled parent context must not prevent Heartbeat from using its
-	// own independent HeartbeatDeadline context.
-
-	var reached int32
-
-	client, _ := newTestClientNoRetry(t, func(w http.ResponseWriter, r *http.Request) {
-		atomic.StoreInt32(&reached, 1)
-		respondJSON(w, http.StatusOK, observer.ObserverResponse{Status: "heartbeat"})
-	})
-
-	// Pass an already-cancelled context as "parent".
-	cancelledCtx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	// Heartbeat should still succeed because it ignores the caller's context.
-	err := client.Heartbeat(cancelledCtx, "hb-independent-ctx")
-	if err != nil {
-		t.Logf("Heartbeat returned error (may be ok if server unreachable): %v", err)
-	}
-	if atomic.LoadInt32(&reached) != 1 {
-		t.Error("Heartbeat should have reached the server even with cancelled parent context")
 	}
 }

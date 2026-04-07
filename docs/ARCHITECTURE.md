@@ -1,174 +1,77 @@
-# ManifestIT Provider — Architecture Overview
+# Architecture
 
-## What this provider does
+## What it does
 
-On every `terraform apply` or `terraform destroy`, the provider fires two events:
+Fires two API events on every `terraform apply` / `destroy`:
 
-1. **`open`** — immediately when `Configure()` is called, before any resources are touched
-2. **`closed`** — when the terraform process finishes, with full git context and identity
+| Event | API call | When |
+|-------|----------|------|
+| open | `POST /api/v1/events` | `Configure()` — before any resources |
+| closed | `PATCH /api/v1/events/{run_id}` | After terraform process exits |
 
-Both events carry the same `run_id` (UUID v4) so the server can correlate them.
-
----
-
-## Component reference
-
-### `internal/provider/init.go`
-
-| Function | Purpose |
-|---|---|
-| `Configure()` | Entry point — wires everything together |
-| `postObserverData()` | Orchestrates the full open/close lifecycle |
-| `detectTerraformOperation()` | Reads parent process cmdline to detect `apply` / `destroy` |
-| `acquireRunLock()` | Atomic `O_EXCL` file lock — exactly one event per terraform run |
-| `generateRunID()` | UUID v4 via `github.com/google/uuid` |
-
-### `internal/provider/watcher.go`
-
-| Function | Purpose |
-|---|---|
-| `WatcherState` | Struct serialised to `$TMPDIR/manifestit-watcher-{ppid}.json` |
-| `writeWatcherState()` / `readWatcherState()` | Disk I/O handoff between `Configure()` and close paths |
-| `registerSignalHandler()` | **CI path** — catches SIGTERM sent directly to the process group |
-| `spawnWatcher()` | **Local path** — detached subprocess (Setsid) polls PPID |
-| `spawnInProcessWatcher()` | **Fallback** — in-process goroutine when subprocess spawn fails |
-| `WatcherMain()` | Entry point when binary runs as `MIT_WATCHER_MODE=1` |
-| `pollUntilDead()` | Polls `kill -0 {ppid}` every 2 s, fires close event on exit |
-| `fireCloseEvent()` | Sends `PATCH /api/v1/events/{run_id}` with pre-collected identity + git |
-| `closeOnce` | `sync.Once` — guarantees exactly one `PATCH /closed` per run |
-
-### `pkg/sdk/providers/observer/observer.go`
-
-| Method | Event | HTTP call |
-|---|---|---|
-| `Post(ctx, ObserverPayload)` | `open` | `POST /api/v1/events` |
-| `Patch(ctx, runID, ClosePayload)` | `closed` | `PATCH /api/v1/events/{run_id}` |
+Both events share the same `run_id` (UUID v4).
 
 ---
 
-## Two close paths — why both are needed
+## Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Scenario              │ Signal to plugin? │ Which path fires?      │
-├─────────────────────────────────────────────────────────────────────┤
-│  Local apply finishes  │ None — gRPC close │ Watcher (polls PPID)   │
-│  Local plugin stalls   │ SIGKILL (uncatch) │ Watcher (polls PPID)   │
-│  ctrl+c during apply   │ SIGINT — eaten by │ Watcher (polls PPID)   │
-│                        │ go-plugin server  │                        │
-│  CI runner tears down  │ SIGTERM (direct,  │ Signal handler         │
-│  job step              │ same process grp) │                        │
-└─────────────────────────────────────────────────────────────────────┘
+terraform apply
+    │
+    ├─► spawns provider plugin process (go-plugin)
+    │       │
+    │       ├─► Configure() called
+    │       │       ├─ detectTerraformOperation() — reads parent cmdline
+    │       │       ├─ acquireRunLock()           — atomic OS link, deduplicates
+    │       │       ├─ POST /open
+    │       │       ├─ spawnWatcher()             — detached subprocess (Setsid)
+    │       │       └─ registerSIGTERMHandler()   — CI close path
+    │       │
+    │       └─► provider process exits (go-plugin SIGKILLs it after gRPC closes)
+    │
+    ├─► all other providers (AWS, GCP...) run in parallel
+    │
+    └─► terraform exits  ◄── watcher polls this (kill -0 every 2s)
+            │
+            └─► watcher subprocess fires PATCH /closed
 ```
 
-**Watcher subprocess** handles local runs because terraform exits cleanly via gRPC
-connection close — no signal is ever sent to the plugin process.
+---
 
-**Signal handler** handles CI runs because the CI runner sends SIGTERM to the
-entire process group (`kill -TERM -{pgid}`). The plugin shares terraform's
-process group (go-plugin sets no `Setpgid`), so it receives SIGTERM directly.
-go-plugin only registers `os.Interrupt` (SIGINT) and ignores it — SIGTERM is
-not intercepted by go-plugin, so our handler is always first to receive it.
+## Two close paths
 
-**In-process goroutine** is an automatic fallback when `spawnWatcher` fails
-(read-only filesystem, binary not executable, out of PIDs, etc.). It runs the
-same PPID-polling logic inside the provider process, so the closed event is
-always guaranteed.
+### 1. Watcher subprocess (local + normal CI/CD completion)
 
-`sync.Once` (`closeOnce`) ensures exactly **one** `PATCH /closed` is ever sent
-regardless of which path wins the race.
+- Spawned by the provider with `Setsid: true` — runs in its own session
+- Survives go-plugin's SIGKILL on the provider process
+- Polls terraform PPID every 2s via `kill -0`
+- Fires `PATCH /closed` when terraform exits
+- Handles: local apply, CI/CD apply completing normally
+
+### 2. SIGTERM handler (CI/CD job teardown)
+
+- CI runners send SIGTERM to the process group when killing a job step
+- Provider plugin shares terraform's PGID (go-plugin does not set Setsid)
+- Handler fires `PATCH /closed` immediately, then re-raises SIGTERM
+- Handles: CI runner timeout, job cancellation, pipeline abort
+
+`providerCloseOnce` (`sync.Once`) ensures exactly one `PATCH /closed` is sent regardless of which path fires first.
 
 ---
 
-## Why identity and git are collected in `Configure()`
+## Deduplication
 
-`go-plugin` forwards `os.Environ()` to the plugin subprocess
-(`client.go:647: cmd.Env = append(cmd.Env, os.Environ()...)`), so CI env vars
-(`GITHUB_ACTIONS`, `GITHUB_RUN_ID`, `GITHUB_ACTOR`, etc.) **are available**
-inside `Configure()`.
-
-The watcher subprocess is spawned with a minimal env — only `MIT_WATCHER_MODE=1`
-and `MIT_WATCHER_STATE=<path>`. It would have no CI context at all.
-
-By collecting identity + git during `Configure()` and storing them in
-`WatcherState` (persisted to disk), both the watcher subprocess and the signal
-handler use the same pre-collected snapshot regardless of when they run.
+Terraform spawns the provider binary multiple times per apply (schema, plan, apply phases). Each is a separate process. The lock file at `$TMPDIR/.manifestit/observer-{ppid}.lock` uses `os.Link` (atomic on POSIX) to ensure only the first process instance fires `POST /open` and spawns the watcher.
 
 ---
 
-## `MIT_WATCHER_MODE` — you never set this
+## Key files
 
-This env var is set **automatically** by the provider when it spawns the watcher
-subprocess. It is an internal re-execution flag.
-
-```go
-// watcher_unix.go — set by the provider, not by you
-cmd.Env = []string{
-    "MIT_WATCHER_MODE=1",
-    "MIT_WATCHER_STATE=" + statePath,
-}
-```
-
-`main.go` checks it at startup:
-
-```go
-if os.Getenv("MIT_WATCHER_MODE") == "1" {
-    provider.WatcherMain()  // runs as watcher subprocess
-    os.Exit(0)
-}
-// otherwise: normal terraform plugin serve path
-```
-
-Never set it in your shell, CI pipeline config, `.env` file, or
-`terraform.tfvars`.
-
----
-
-## Lock and state files
-
-Both files live in `$TMPDIR` and are cleaned up automatically after the closed
-event fires.
-
-| File | Purpose | Content |
-|---|---|---|
-| `manifestit-observer-{ppid}.lock` | Idempotency — one open event per run | `"ppid:run_uuid"` |
-| `manifestit-watcher-{ppid}.json` | Handoff — passes config + context to close paths | Full `WatcherState` JSON (mode `0600`) |
-
----
-
-## Supported CI systems
-
-The provider auto-detects the CI environment from standard env vars and includes
-the context in `identity` of the closed event.
-
-| CI System | Detection env var |
-|---|---|
-| GitHub Actions | `GITHUB_ACTIONS=true` |
-| GitLab CI | `GITLAB_CI=true` |
-| Jenkins | `JENKINS_URL` |
-| CircleCI | `CIRCLECI=true` |
-| Azure DevOps | `TF_BUILD=True` |
-| Bitbucket Pipelines | `BITBUCKET_BUILD_NUMBER` |
-| TeamCity | `TEAMCITY_VERSION` |
-| AWS CodeBuild | `CODEBUILD_BUILD_ID` |
-| Google Cloud Build | `BUILD_ID` + `PROJECT_ID` |
-| Spacelift | `SPACELIFT=true` |
-| Atlantis | `ATLANTIS_TERRAFORM_VERSION` |
-| env0 | `ENV0_ENVIRONMENT_ID` |
-
----
-
-## Test files
-
-| File | What it tests |
-|---|---|
-| `internal/provider/watcher_test.go` | WatcherState serialisation, UUID generation, lock acquisition, stale lock reclaim, PPID polling |
-| `pkg/sdk/providers/observer/observer_test.go` | Post (open), Patch (closed), HTTP error handling, JSON field presence |
-
----
-
-## Further reading
-
-- [`FLOW_DIAGRAM.md`](./FLOW_DIAGRAM.md) — step-by-step ASCII flow for every shutdown scenario
-- [`LOCAL_TEST_GUIDE.md`](./LOCAL_TEST_GUIDE.md) — how to test locally and simulate CI/CD with `run.sh` and `ci-simulate.sh`
-
+| File | Purpose |
+|------|---------|
+| `internal/provider/init.go` | Provider setup, `Configure()`, lock, `POST /open` |
+| `internal/provider/lifecycle.go` | Watcher subprocess, SIGTERM handler, `PATCH /closed` |
+| `pkg/sdk/providers/observer/observer.go` | HTTP client for open/closed API calls |
+| `main.go` | Entry point — routes `MIT_WATCHER_MODE=1` to `WatcherMain()` |
+</content>
+</invoke>

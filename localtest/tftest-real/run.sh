@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
 # localtest/tftest-real/run.sh
 #
-# Builds the binary, resets mock server events, runs terraform apply,
-# waits for the watcher subprocess, then prints provider log + watcher log
-# + event summary with pass/fail verdict.
+# Local run test: build → reset mock → terraform apply → verify 1 open + 1 closed.
 #
 # Usage:
-#   # Terminal 1 — start mock server (see colour-coded events arrive live):
-#   go run ./localtest/mock-server/main.go
+#   Terminal 1: go run ./localtest/mock-server/main.go
+#   Terminal 2: bash localtest/tftest-real/run.sh
 #
-#   # Terminal 2 — run this script:
-#   bash localtest/tftest-real/run.sh
-#
-# Log files written automatically (no TF_LOG needed):
-#   $TMPDIR/manifestit-provider-{ppid}.log  — provider lifecycle steps
-#   $TMPDIR/manifestit-watcher-{ppid}.log   — watcher subprocess steps
+# Logs (no TF_LOG needed):
+#   ~/.manifestit/provider-{ppid}.log         — provider lifecycle
+#   ~/.manifestit/watcher-terraform-{ppid}.log — watcher subprocess (close event)
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO_ROOT/localtest/tftest-real"
-TMPD="$(python3 -c 'import tempfile; print(tempfile.gettempdir())' 2>/dev/null || echo /tmp)"
+LOGDIR="$HOME/.manifestit"
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 echo ">>> Building provider binary..."
@@ -28,7 +23,7 @@ go build -o localtest/bin/terraform-provider-manifestit .
 echo ">>> Binary ready: localtest/bin/terraform-provider-manifestit"
 
 # ── 2. Clean old logs + reset mock server ─────────────────────────────────────
-rm -f "$TMPD"/manifestit-provider-*.log "$TMPD"/manifestit-watcher-*.log 2>/dev/null || true
+rm -f "$LOGDIR"/provider-*.log "$LOGDIR"/watcher-terraform-*.log 2>/dev/null || true
 if curl -sf --max-time 2 http://localhost:8080/dump > /dev/null 2>&1; then
   curl -s -X POST http://localhost:8080/reset > /dev/null
   echo ">>> Mock server events cleared (localhost:8080)"
@@ -43,7 +38,7 @@ cd "$DIR"
 
 echo ""
 echo ">>> Running terraform apply..."
-echo ">>> (null_resource sleeps 10s — simulates slow AWS/GCP resources)"
+echo ">>> (null_resource sleeps 10s — proves closed fires after all resources)"
 echo "================================================================="
 echo ""
 
@@ -64,17 +59,17 @@ echo ">>> wait done:    $WAIT_END"
 
 # ── 5. Provider log ───────────────────────────────────────────────────────────
 echo ""
-echo ">>> PROVIDER LOG ($TMPD/manifestit-provider-*.log):"
+echo ">>> PROVIDER LOG ($LOGDIR/provider-*.log):"
 echo "-----------------------------------------------------------------"
-PLOG=$(ls -t "$TMPD"/manifestit-provider-*.log 2>/dev/null | head -1)
-if [[ -n "$PLOG" ]]; then cat "$PLOG"; else echo "(no provider log found)"; fi
+PLOGS=$(ls "$LOGDIR"/provider-*.log 2>/dev/null)
+if [[ -n "$PLOGS" ]]; then cat $PLOGS; else echo "(no provider log found)"; fi
 echo "-----------------------------------------------------------------"
 
 # ── 6. Watcher log ────────────────────────────────────────────────────────────
 echo ""
-echo ">>> WATCHER SUBPROCESS LOG ($TMPD/manifestit-watcher-*.log):"
+echo ">>> WATCHER SUBPROCESS LOG ($LOGDIR/watcher-terraform-*.log):"
 echo "-----------------------------------------------------------------"
-WLOG=$(ls -t "$TMPD"/manifestit-watcher-*.log 2>/dev/null | head -1)
+WLOG=$(ls -t "$LOGDIR"/watcher-terraform-*.log 2>/dev/null | head -1)
 if [[ -n "$WLOG" ]]; then cat "$WLOG"; else echo "(no watcher log found)"; fi
 echo "-----------------------------------------------------------------"
 
