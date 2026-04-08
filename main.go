@@ -27,24 +27,17 @@ func main() {
 
 	var serveOpts providerserver.ServeOpts
 
-	serveOpts.Address = "registry.terraform.io/manifest-it/manifestit"
-
 	if debugMode {
 		serveOpts.Debug = true
 	}
 
-	// providerserver.Serve blocks for the entire terraform run.
-	// When it returns the gRPC connection has been closed by terraform (normal
-	// completion, ctrl+c, or SIGTERM). The watcher subprocess — spawned during
-	// Configure — fires PATCH /closed once the terraform binary (PPID) exits.
-	// If go-plugin sends SIGKILL after a stall, Serve never returns; the watcher
-	// detects this via its PPID poll loop and fires PATCH /closed regardless.
+	serveOpts.Address = "registry.terraform.io/manifestit/manifestit"
+
 	err := providerserver.Serve(
 		context.Background(),
 		provider.New,
 		serveOpts,
 	)
-
 	if err != nil {
 		log.Fatal(err)
 	}
