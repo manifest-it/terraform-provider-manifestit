@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -206,12 +205,20 @@ func TestSIGTERM_firesPatchClosed(t *testing.T) {
 
 	obs := &mockObserver{}
 	lockPath := tmpLockPath(t)
-	state := runState{RunID: generateRunID(), Action: "apply", LockPath: lockPath}
 
-	_, cancel := context.WithCancel(context.Background())
+	// Create the lock file so the cross-process guard in registerSIGTERMHandler
+	// can atomically remove it (ErrNotExist means "already fired elsewhere").
+	runID := generateRunID()
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d:%s", os.Getpid(), runID)), 0644); err != nil {
+		t.Fatalf("create lock: %v", err)
+	}
 
-	registerSIGTERMHandler(cancel, obs, state.RunID, state)
-	syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	state := runState{RunID: runID, Action: "apply", LockPath: lockPath}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	registerSIGTERMHandler(ctx, cancel, obs, state.RunID, state)
+	sendTestSIGTERM(os.Getpid())
 
 	// Allow signal goroutine to fire.
 	deadline := time.Now().Add(2 * time.Second)

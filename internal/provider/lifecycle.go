@@ -24,16 +24,18 @@ var (
 // runState carries everything the watcher subprocess needs to fire PATCH /closed.
 // Serialised to a temp file; the subprocess reads and deletes it on startup.
 type runState struct {
-	RunID    string `json:"run_id"`
-	Action   string `json:"action"`
-	APIKey   string `json:"api_key"`
-	BaseURL  string `json:"base_url"`
-	OrgID    string `json:"org_id"`
-	OrgKey   string `json:"org_key"`
-	LockPath string `json:"lock_path"`
-	PPID     int    `json:"ppid"`
-	Identity any    `json:"identity,omitempty"`
-	Git      any    `json:"git,omitempty"`
+	RunID                   string `json:"run_id"`
+	Action                  string `json:"action"`
+	APIKey                  string `json:"api_key"`
+	BaseURL                 string `json:"base_url"`
+	OrgID                   string `json:"org_id"`
+	ProviderID              string `json:"provider_id"`
+	ProviderConfigurationID string `json:"provider_configuration_id"`
+	OrgKey                  string `json:"org_key"`
+	LockPath                string `json:"lock_path"`
+	PPID                    int    `json:"ppid"`
+	Identity                any    `json:"identity,omitempty"`
+	Git                     any    `json:"git,omitempty"`
 }
 
 // providerLog writes to $HOME/.manifestit/provider-{ppid}.log.
@@ -97,9 +99,10 @@ func readRunState(path string) (runState, error) {
 
 // spawnWatcher launches a detached copy of this binary in watcher mode.
 //
-// The subprocess runs in its own session (Setsid) so go-plugin's SIGKILL on
-// the provider process does not kill it. It polls terraform's PPID every 2s
-// and fires PATCH /closed once terraform exits — after all providers finish.
+// The subprocess runs in its own session/process-group (platform-specific via
+// setSysProcAttr) so go-plugin's SIGKILL on the provider process does not kill
+// it. It polls terraform's PPID every 2s and fires PATCH /closed once terraform
+// exits — after all providers finish.
 func spawnWatcher(statePath string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -119,13 +122,20 @@ func spawnWatcher(statePath string) error {
 	logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 
 	cmd := exec.Command(exe)
-	cmd.Env = append([]string{
+	env := []string{
 		"MIT_WATCHER_MODE=1",
 		"MIT_WATCHER_STATE=" + statePath,
-		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
-	}, proxyEnv()...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	}
+	// Only pass HOME when it is actually set — avoids "HOME=" in containers.
+	if h := os.Getenv("HOME"); h != "" {
+		env = append(env, "HOME="+h)
+	}
+	cmd.Env = append(env, proxyEnv()...)
+
+	// Platform-specific: Setsid (unix) or CREATE_NEW_PROCESS_GROUP (windows).
+	setSysProcAttr(cmd)
+
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -151,11 +161,21 @@ func proxyEnv() []string {
 	return env
 }
 
-// cleanStaleFiles removes observer lock files and watcher state files in
-// stateDir() whose owner PPID is no longer alive. Called at apply start so
-// files from crashed/killed previous runs don't accumulate.
+// cleanStaleFiles removes observer lock files, watcher state files, and log
+// files in stateDir()/logDir() whose owner PPID is no longer alive. Called at
+// apply start so files from crashed/killed previous runs don't accumulate.
 func cleanStaleFiles() {
-	dir := stateDir()
+	stDir := stateDir()
+	cleanStateDir(stDir)
+
+	lgDir := logDir()
+	cleanStaleLogs(lgDir)
+	if lgDir != stDir {
+		cleanStaleLogs(stDir)
+	}
+}
+
+func cleanStateDir(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -182,8 +202,36 @@ func cleanStaleFiles() {
 	}
 }
 
+// cleanStaleLogs removes watcher-terraform-{ppid}.log and provider-{ppid}.log
+// files whose PPID is no longer alive.
+func cleanStaleLogs(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if filepath.Ext(name) != ".log" {
+			continue
+		}
+		var ppid int
+		if _, err := fmt.Sscanf(name, "watcher-terraform-%d.log", &ppid); err == nil {
+			if !processExists(ppid) {
+				os.Remove(filepath.Join(dir, name))
+			}
+			continue
+		}
+		if _, err := fmt.Sscanf(name, "provider-%d.log", &ppid); err == nil {
+			if !processExists(ppid) {
+				os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
+}
+
 // WatcherMain is the entry point when MIT_WATCHER_MODE=1.
 // Polls terraform PPID and fires PATCH /closed when it exits.
+// Also handles SIGTERM/Interrupt in case the container or CI job is cancelled.
 func WatcherMain() {
 	statePath := os.Getenv("MIT_WATCHER_STATE")
 	if statePath == "" {
@@ -200,55 +248,104 @@ func WatcherMain() {
 
 	fmt.Fprintf(os.Stderr, "manifestit-watcher: run_id=%s ppid=%d base_url=%s\n", state.RunID, state.PPID, state.BaseURL)
 
-	obs, err := buildProviderClient(state.APIKey, state.BaseURL, state.OrgID, state.OrgKey)
+	obs, err := buildProviderClient(state.APIKey, state.BaseURL, state.OrgID, state.OrgKey, state.ProviderID, state.ProviderConfigurationID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "manifestit-watcher: cannot build client: %v\n", err)
 		os.Exit(1)
 	}
 
-	for {
-		time.Sleep(2 * time.Second)
-		if !processExists(state.PPID) {
-			break
+	// Intercept SIGTERM and os.Interrupt (covers Linux CI job cancel and Windows
+	// CTRL_C) so the watcher can fire PATCH /closed before exiting.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	// Poll loop with a 4-hour safety cap to guard against PID reuse / stale
+	// results in container PID namespaces.
+	pollDone := make(chan struct{})
+	go func() {
+		deadline := time.Now().Add(4 * time.Hour)
+		for time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+			if !processExists(state.PPID) {
+				break
+			}
 		}
+		close(pollDone)
+	}()
+
+	select {
+	case <-pollDone:
+		fmt.Fprintf(os.Stderr, "manifestit-watcher: terraform exited, firing close\n")
+	case sig := <-sigCh:
+		fmt.Fprintf(os.Stderr, "manifestit-watcher: received signal %v, firing close\n", sig)
 	}
 
-	fmt.Fprintf(os.Stderr, "manifestit-watcher: terraform exited, firing close\n")
+	// Atomically claim the "fire close" role by removing the lock first.
+	// If the lock is already gone the provider's SIGTERM handler already fired —
+	// exit without duplicating the PATCH /closed call.
+	if err := os.Remove(state.LockPath); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "manifestit-watcher: lock already removed — close event fired by provider process\n")
+			return
+		}
+		// Other error (permissions, etc.) — still attempt the close call.
+		fmt.Fprintf(os.Stderr, "manifestit-watcher: lock remove error: %v — firing close anyway\n", err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), observer.CloseDeadline)
 	defer cancel()
 	fireCloseEvent(ctx, obs, state.RunID, state)
-	os.Remove(state.LockPath)
 }
 
 // sigTermReraiseHook is overridden in tests to prevent killing the test process.
 var sigTermReraiseHook func()
 
 // registerSIGTERMHandler handles CI job teardown.
-// CI runners send SIGTERM to the process group; the plugin shares terraform's
-// PGID so it receives it directly. go-plugin only intercepts SIGINT, not SIGTERM.
-func registerSIGTERMHandler(cancel context.CancelFunc, obs observer.Client, runID string, state runState) {
+//
+// CI runners send SIGTERM to the process group on job cancellation; the plugin
+// shares terraform's PGID so it receives it directly. go-plugin only intercepts
+// SIGINT, not SIGTERM. On Windows, CTRL_C_EVENT is mapped to os.Interrupt.
+//
+// ctx should be cancelled when the provider is shutting down normally so the
+// goroutine can be collected (prevents goroutine leaks under goleak).
+func registerSIGTERMHandler(ctx context.Context, cancel context.CancelFunc, obs observer.Client, runID string, state runState) {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM)
+	// syscall.SIGTERM: Linux/macOS CI job cancel.
+	// os.Interrupt:   Windows CTRL_C + Linux Ctrl+C (covers both CI and interactive).
+	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
 
 	go func() {
 		defer signal.Stop(ch)
 		select {
 		case <-ch:
+		case <-ctx.Done():
+			return // provider shutting down normally — no signal received
 		}
 
-		providerLog("SIGTERM — firing PATCH /closed")
+		providerLog("SIGTERM/Interrupt — firing PATCH /closed")
 		cancel()
 		providerCloseOnce.Do(func() {
-			ctx, done := context.WithTimeout(context.Background(), observer.CloseDeadline)
+			// Atomically claim the "fire close" role by removing the lock first.
+			// If the lock is already gone the watcher subprocess already fired —
+			// exit without duplicating the PATCH /closed call.
+			if err := os.Remove(state.LockPath); err != nil {
+				if os.IsNotExist(err) {
+					providerLog("lock already removed — close event fired by watcher")
+					return
+				}
+				// Other error — still attempt the close call (best effort).
+			}
+			closeCtx, done := context.WithTimeout(context.Background(), observer.CloseDeadline)
 			defer done()
-			fireCloseEvent(ctx, obs, runID, state)
-			os.Remove(state.LockPath)
+			fireCloseEvent(closeCtx, obs, runID, state)
 		})
 
 		if sigTermReraiseHook != nil {
 			sigTermReraiseHook()
 		} else {
-			syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			// Platform-specific re-raise: syscall.Kill on unix, os.Exit(1) on Windows.
+			reraiseSIGTERM()
 		}
 	}()
 }

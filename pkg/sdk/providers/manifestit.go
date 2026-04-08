@@ -43,6 +43,10 @@ func NewProviderClient(cfg Config) (*ProviderClient, error) {
 		authStrategy = auth.NewNoAuth()
 	}
 
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = http.DefaultClient
+	}
+
 	executor := sdk.NewHTTPExecutor(sdk.HTTPExecutorConfig{
 		Client:     cfg.HTTPClient,
 		Auth:       authStrategy,

@@ -34,13 +34,11 @@ func main() {
 	}
 
 	// providerserver.Serve blocks for the entire terraform run.
-	// When it returns (gRPC connection closed by terraform — normal completion,
-	// ctrl+c via go-plugin SIGINT handler, or plugin stall → SIGKILL by go-plugin),
-	// we call RunCleanup() to fire the PATCH /closed event and stop the heartbeat.
-	//
-	// Note on SIGKILL: if go-plugin sends SIGKILL after a stall, Serve() never
-	// returns and RunCleanup() is never called. The server will mark the event
-	// "timed_out" after the ServerTimeoutWindow (60s) — this is acceptable.
+	// When it returns the gRPC connection has been closed by terraform (normal
+	// completion, ctrl+c, or SIGTERM). The watcher subprocess — spawned during
+	// Configure — fires PATCH /closed once the terraform binary (PPID) exits.
+	// If go-plugin sends SIGKILL after a stall, Serve never returns; the watcher
+	// detects this via its PPID poll loop and fires PATCH /closed regardless.
 	err := providerserver.Serve(
 		context.Background(),
 		provider.New,

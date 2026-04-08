@@ -192,15 +192,17 @@ func defaultConfigureFunc(p *Provider, _ *provider.ConfigureRequest, config *Sch
 }
 
 // buildProviderClient creates a minimal observer client for the watcher subprocess.
-func buildProviderClient(apiKey, baseURL, orgID, orgKey string) (observer.Client, error) {
+func buildProviderClient(apiKey, baseURL, orgID, orgKey, providerID, providerCfgID string) (observer.Client, error) {
 	client, err := providers.NewProviderClient(providers.Config{
-		APIKey:     apiKey,
-		BaseURL:    baseURL,
-		OrgID:      orgID,
-		OrgKey:     orgKey,
-		Debug:      os.Getenv("DEBUG") == "true",
-		Logger:     zerolog.New(os.Stderr).With().Timestamp().Logger(),
-		MaxRetries: 3,
+		APIKey:                  apiKey,
+		BaseURL:                 baseURL,
+		OrgID:                   orgID,
+		OrgKey:                  orgKey,
+		ProviderID:              providerID,
+		ProviderConfigurationID: providerCfgID,
+		Debug:                   os.Getenv("DEBUG") == "true",
+		Logger:                  zerolog.New(os.Stderr).With().Timestamp().Logger(),
+		MaxRetries:              3,
 	})
 	if err != nil {
 		return nil, err
@@ -236,6 +238,32 @@ func (p *Provider) runLifecycle(ctx context.Context, config *Schema, operation s
 	runID, lockPath, alreadyPosted := acquireRunLock()
 	if alreadyPosted {
 		providerLog("lock held — skipping (another instance owns this run)")
+		// Register a SIGTERM handler even when we did not post the open event.
+		// This covers the apply-phase plugin: if CI cancels the job after plan
+		// but before apply finishes, the apply process now fires PATCH /closed
+		// (using the runID written by the plan-phase plugin into the lock file).
+		if data, err := os.ReadFile(lockPath); err == nil {
+			parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+			if len(parts) == 2 {
+				existingRunID := parts[1]
+				orgID := strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
+				existingState := runState{
+					RunID:                   existingRunID,
+					Action:                  operation,
+					APIKey:                  config.ApiKey.ValueString(),
+					BaseURL:                 config.ApiUrl.ValueString(),
+					OrgID:                   orgID,
+					OrgKey:                  config.OrgKey.ValueString(),
+					ProviderID:              int32ToString(config.ProviderId),
+					ProviderConfigurationID: int32ToString(config.ProviderConfigurationId),
+					LockPath:                lockPath,
+					PPID:                    os.Getppid(),
+				}
+				shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+				registerSIGTERMHandler(shutdownCtx, shutdownCancel, p.Client.Observer, existingRunID, existingState)
+				providerLog("SIGTERM handler registered for existing run_id=%s", existingRunID)
+			}
+		}
 		return diags
 	}
 	providerLog("lifecycle start run_id=%s pid=%d ppid=%d", runID, os.Getpid(), os.Getppid())
@@ -265,20 +293,22 @@ func (p *Provider) runLifecycle(ctx context.Context, config *Schema, operation s
 	providerLog("POST /open OK run_id=%s", runID)
 
 	state := runState{
-		RunID:    runID,
-		Action:   operation,
-		APIKey:   config.ApiKey.ValueString(),
-		BaseURL:  config.ApiUrl.ValueString(),
-		OrgID:    orgID,
-		OrgKey:   config.OrgKey.ValueString(),
-		LockPath: lockPath,
-		PPID:     os.Getppid(),
-		Identity: result.Identity,
-		Git:      result.Git,
+		RunID:                   runID,
+		Action:                  operation,
+		APIKey:                  config.ApiKey.ValueString(),
+		BaseURL:                 config.ApiUrl.ValueString(),
+		OrgID:                   orgID,
+		OrgKey:                  config.OrgKey.ValueString(),
+		ProviderID:              int32ToString(config.ProviderId),
+		ProviderConfigurationID: int32ToString(config.ProviderConfigurationId),
+		LockPath:                lockPath,
+		PPID:                    os.Getppid(),
+		Identity:                result.Identity,
+		Git:                     result.Git,
 	}
 
-	_, cancel := context.WithCancel(context.Background())
-	registerSIGTERMHandler(cancel, p.Client.Observer, runID, state)
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	registerSIGTERMHandler(shutdownCtx, shutdownCancel, p.Client.Observer, runID, state)
 	providerLog("SIGTERM handler registered")
 
 	statePath, err := writeRunState(state)

@@ -55,7 +55,7 @@ type ObserverResponse struct {
 	Status string `json:"status"`
 }
 
-const basePath = "/api/v1/events"
+const basePath = "/events"
 
 // client implements Client using the SDK's APIClient.
 type client struct {
