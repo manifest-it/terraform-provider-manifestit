@@ -443,11 +443,12 @@ func (p *Provider) runLifecycle(ctx context.Context, config *ProviderSchema, ope
 	collectCancel()
 
 	_, postErr := p.Client.Observer.Post(ctx, observer.ObserverPayload{
-		RunID:       runID,
-		Status:      "open",
-		CollectedAt: time.Now().UTC().Format(time.RFC3339),
-		Action:      operation,
-		OrgID:       orgID,
+		RunID:         runID,
+		Status:        "open",
+		CollectedAt:   time.Now().UTC().Format(time.RFC3339),
+		Action:        operation,
+		OrgID:         orgID,
+		ProviderCfgID: int32ToString(config.ProviderConfigurationId),
 	})
 	if postErr != nil {
 		providerLog("POST /open FAILED: %v", postErr)

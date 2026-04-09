@@ -364,12 +364,14 @@ func fireCloseEvent(ctx context.Context, obs observer.Client, runID string, stat
 	}
 
 	_, err := obs.Patch(ctx, runID, observer.ClosePayload{
-		Status:      "closed",
-		Identity:    identity,
-		Git:         git,
-		CollectedAt: time.Now().UTC().Format(time.RFC3339),
-		Action:      state.Action,
-		OrgID:       state.OrgID,
+		Status:        "closed",
+		Identity:      identity,
+		Git:           git,
+		CollectedAt:   time.Now().UTC().Format(time.RFC3339),
+		Action:        state.Action,
+		OrgID:         state.OrgID,
+		ProviderCfgID: state.ProviderConfigurationID,
+		RunID:         state.RunID,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "manifestit: PATCH /closed FAILED run_id=%s: %v\n", runID, err)
