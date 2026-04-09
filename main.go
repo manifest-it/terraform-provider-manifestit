@@ -4,13 +4,21 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
 	"terraform-provider-manifestit/internal/provider"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 )
 
 func main() {
-	ctx := context.Background()
+	// When spawned as the watcher subprocess, run WatcherMain and exit.
+	// The provider binary re-execs itself with MIT_WATCHER_MODE=1 after
+	// POST /open so the watcher survives go-plugin's SIGKILL and can fire
+	// PATCH /closed once the terraform binary (PPID) fully exits.
+	if os.Getenv("MIT_WATCHER_MODE") == "1" {
+		provider.WatcherMain()
+		os.Exit(0)
+	}
 
 	var debugMode bool
 
@@ -26,7 +34,7 @@ func main() {
 	serveOpts.Address = "registry.terraform.io/manifest-it/manifestit"
 
 	err := providerserver.Serve(
-		ctx,
+		context.Background(),
 		provider.New,
 		serveOpts,
 	)

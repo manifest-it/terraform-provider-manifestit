@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
 	"terraform-provider-manifestit/internal/collectors"
 	resource2 "terraform-provider-manifestit/internal/resource"
 	"terraform-provider-manifestit/pkg/sdk/providers"
 	"terraform-provider-manifestit/pkg/sdk/providers/observer"
 	"terraform-provider-manifestit/pkg/utils"
-	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -28,15 +31,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-var (
-	_ provider.Provider = &Provider{}
-)
+var _ provider.Provider = &Provider{}
 
 type Provider struct {
-	HttpClient *http.Client
-	Client     *providers.ProviderClient
-
-	ConfigureCallbackFunc func(p *Provider, request *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics
+	HttpClient            *http.Client
+	Client                *providers.ProviderClient
+	ConfigureCallbackFunc func(p *Provider, req *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics
 	Now                   func() time.Time
 	DefaultTags           map[string]string
 }
@@ -67,6 +67,14 @@ func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 	}
 }
 
+func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource {
+	return nil
+}
+
+func (p *Provider) Metadata(_ context.Context, _ provider.MetadataRequest, response *provider.MetadataResponse) {
+	response.TypeName = "manifestit"
+}
+
 func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequest, response *provider.ConfigureResponse) {
 	var config ProviderSchema
 	response.Diagnostics.Append(request.Config.Get(ctx, &config)...)
@@ -86,12 +94,17 @@ func (p *Provider) Configure(ctx context.Context, request provider.ConfigureRequ
 
 	response.DataSourceData = p.Client
 	response.ResourceData = p.Client
-	response.Diagnostics.Append(p.postObserverData(ctx, &config)...)
+
+	// Collect and post observer data on every provider configuration.
+	// This fires on every terraform operation (plan, apply, destroy).
+	// Runs synchronously to ensure it completes before Terraform terminates the provider.
+	response.Diagnostics.Append(p.startLifecycle(ctx, &config)...)
 }
 
 func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
+	// api_key: optional in schema, falls back to env, error if neither set
 	if config.ApiKey.IsNull() {
 		apiKey, err := utils.GetMultiEnvVar(utils.MITAPIKey)
 		if err != nil {
@@ -101,6 +114,7 @@ func (p *Provider) ConfigureConfigDefaults(ctx context.Context, config *Provider
 		config.ApiKey = types.StringValue(apiKey)
 	}
 
+	// Retry settings: optional with env var fallbacks and defaults.
 	if config.HttpClientRetryMaxRetries.IsNull() {
 		rTimeout, err := utils.GetMultiEnvVar(utils.MITHTTPRetryMaxRetries)
 		if err == nil {
@@ -128,6 +142,7 @@ func (p *Provider) ValidateConfigValues(ctx context.Context, config *ProviderSch
 	oneOfStringValidator := stringvalidator.OneOf("true", "false")
 	int64BetweenValidator := int64validator.Between(1, 5)
 
+	// Validate boolean-style string fields
 	if !config.Validate.IsNull() {
 		res := validator.StringResponse{}
 		oneOfStringValidator.ValidateString(ctx, validator.StringRequest{ConfigValue: config.Validate}, &res)
@@ -147,14 +162,6 @@ func (p *Provider) ValidateConfigValues(ctx context.Context, config *ProviderSch
 	}
 
 	return diags
-}
-
-func (p *Provider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return nil
-}
-
-func (p *Provider) Metadata(_ context.Context, _ provider.MetadataRequest, response *provider.MetadataResponse) {
-	response.TypeName = "manifestit"
 }
 
 func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
@@ -210,6 +217,103 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 	}
 }
 
+// detectTerraformOperation inspects the parent process command line to determine
+// the current Terraform operation (plan, apply, destroy, etc.).
+// The provider runs as a child process of terraform, so the parent's command
+// line reveals which subcommand was invoked.
+func detectTerraformOperation() string {
+	// Debug mode: provider runs standalone via go run / binary + TF_REATTACH_PROVIDERS.
+	// Parent is shell/IDE, so default to "apply" to ensure posting.
+	if os.Getenv("TF_REATTACH_PROVIDERS") != "" {
+		return "apply"
+	}
+
+	ppid := os.Getppid()
+	out, err := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(ppid)).Output()
+	if err != nil {
+		// ps failed, can't determine operation
+		return "unknown"
+	}
+
+	cmdLine := strings.TrimSpace(string(out))
+
+	// Check for known terraform subcommands in order of specificity.
+	// "apply" must be checked before "plan" since "terraform apply" also
+	// runs a plan phase internally.
+	for _, op := range []string{"apply", "destroy", "import", "refresh", "plan"} {
+		if strings.Contains(cmdLine, op) {
+			return op
+		}
+	}
+	return "unknown"
+}
+
+// alreadyPostedForParent checks if we've already posted for the current parent
+// terraform process. Uses a temp file keyed on the parent PID to deduplicate
+// across separate provider process invocations within the same terraform command.
+func alreadyPostedForParent() bool {
+	ppid := os.Getppid()
+	lockFile := fmt.Sprintf("/tmp/manifestit-observer-%d.lock", ppid)
+
+	// Check if lock file exists and is recent (within last 30 seconds)
+	if info, err := os.Stat(lockFile); err == nil {
+		if time.Since(info.ModTime()) < 30*time.Second {
+			return true
+		}
+	}
+
+	// Create/update the lock file
+	_ = os.WriteFile(lockFile, []byte(strconv.Itoa(ppid)), 0644)
+	return false
+}
+
+// postObserverData collects local identity and git context
+// then posts them to the ManifestIT API. Skips posting during plan-only operations.
+func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+	var diags diag.Diagnostics
+	operation := detectTerraformOperation()
+
+	// Skip posting for plan and refresh operations.
+	// Plan is read-only; refresh only syncs drift and increments serial,
+	// which would confuse backend serial tracking.
+	if operation == "plan" || operation == "refresh" {
+		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
+		return diags
+	}
+
+	// Terraform spawns separate provider processes for plan and apply phases.
+	// Deduplicate by checking a lock file keyed on the parent terraform PID.
+	if alreadyPostedForParent() {
+		return diags
+	}
+
+	c := collectors.NewCollector(collectors.DefaultCollectConfig())
+	if !config.TrackedBranch.IsNull() {
+		c.TrackedBranch = config.TrackedBranch.ValueString()
+	}
+	if !config.TrackedRepo.IsNull() {
+		c.TrackedRepo = config.TrackedRepo.ValueString()
+	}
+	result := c.Collect(ctx)
+
+	orgID := ""
+	if !config.OrgId.IsNull() {
+		orgID = strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
+	}
+
+	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
+		Identity:    result.Identity,
+		Git:         result.Git,
+		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
+		Action:      operation,
+		OrgID:       orgID,
+	})
+	if err != nil {
+		diags.AddWarning("ManifestIT observer post failed", err.Error())
+	}
+	return diags
+}
+
 func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, config *ProviderSchema) diag.Diagnostics {
 	var diags diag.Diagnostics
 
@@ -252,111 +356,212 @@ func defaultConfigureFunc(p *Provider, request *provider.ConfigureRequest, confi
 	return diags
 }
 
-func (p *Provider) postObserverData(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
-	var diags diag.Diagnostics
-	operation := detectTerraformOperation()
-
-	if operation != "apply" && operation != "destroy" {
-		tflog.Debug(ctx, "skipping observer post", map[string]interface{}{"operation": operation})
-		return diags
-	}
-
-	if alreadyPostedForParent() {
-		return diags
-	}
-
-	c := collectors.NewCollector(collectors.DefaultCollectConfig())
-	if !config.TrackedBranch.IsNull() {
-		c.TrackedBranch = config.TrackedBranch.ValueString()
-	}
-	if !config.TrackedRepo.IsNull() {
-		c.TrackedRepo = config.TrackedRepo.ValueString()
-	}
-	result := c.Collect(ctx)
-
-	orgID := ""
-	if !config.OrgId.IsNull() {
-		orgID = strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
-	}
-
-	_, err := p.Client.Observer.Post(ctx, observer.ObserverPayload{
-		Identity:    result.Identity,
-		Git:         result.Git,
-		CollectedAt: result.CollectedAt.UTC().Format(time.RFC3339),
-		Action:      operation,
-		OrgID:       orgID,
+// buildProviderClient creates a minimal observer client for the watcher subprocess.
+func buildProviderClient(apiKey, baseURL, orgID, orgKey, providerID, providerCfgID string) (observer.Client, error) {
+	client, err := providers.NewProviderClient(providers.Config{
+		APIKey:                  apiKey,
+		BaseURL:                 baseURL,
+		OrgID:                   orgID,
+		OrgKey:                  orgKey,
+		ProviderID:              providerID,
+		ProviderConfigurationID: providerCfgID,
+		Debug:                   os.Getenv("DEBUG") == "true",
+		Logger:                  zerolog.New(os.Stderr).With().Timestamp().Logger(),
+		MaxRetries:              3,
 	})
 	if err != nil {
-		diags.AddWarning("ManifestIT observer post failed", err.Error())
+		return nil, err
 	}
+	return client.Observer, nil
+}
+
+// startLifecycle is called from Configure(). Fires POST /open, spawns the
+// watcher subprocess, and registers the SIGTERM handler. Guards via
+// providerRunOnce so it runs at most once per process lifetime.
+func (p *Provider) startLifecycle(ctx context.Context, config *ProviderSchema) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	operation := detectTerraformOperation()
+	providerLog("operation=%s pid=%d ppid=%d", operation, os.Getpid(), os.Getppid())
+
+	if operation != "apply" && operation != "destroy" {
+		tflog.Debug(ctx, "manifestit: skipping lifecycle", map[string]interface{}{"operation": operation})
+		return diags
+	}
+
+	cleanStaleFiles()
+
+	providerRunOnce.Do(func() {
+		diags = p.runLifecycle(ctx, config, operation)
+	})
 	return diags
 }
 
-// detectTerraformOperation reads the parent process command line to determine
-// the terraform subcommand (apply, destroy, plan, etc.).
-func detectTerraformOperation() string {
-	if os.Getenv("TF_REATTACH_PROVIDERS") != "" {
-		return "apply"
-	}
+func (p *Provider) runLifecycle(ctx context.Context, config *ProviderSchema, operation string) diag.Diagnostics {
+	var diags diag.Diagnostics
 
-	ppid := os.Getppid()
-	cmdLine, err := getParentCommandLine(ppid)
-	if err != nil {
-		return "unknown"
-	}
-
-	for _, op := range []string{"apply", "destroy", "import", "refresh", "plan"} {
-		if strings.Contains(cmdLine, op) {
-			return op
+	runID, lockPath, alreadyPosted := acquireRunLock()
+	if alreadyPosted {
+		providerLog("lock held — skipping (another instance owns this run)")
+		// Register a SIGTERM handler even when we did not post the open event.
+		// This covers the apply-phase plugin: if CI cancels the job after plan
+		// but before apply finishes, the apply process now fires PATCH /closed
+		// (using the runID written by the plan-phase plugin into the lock file).
+		if data, err := os.ReadFile(lockPath); err == nil {
+			parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+			if len(parts) == 2 {
+				existingRunID := parts[1]
+				orgID := strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
+				existingState := runState{
+					RunID:                   existingRunID,
+					Action:                  operation,
+					APIKey:                  config.ApiKey.ValueString(),
+					BaseURL:                 config.ApiUrl.ValueString(),
+					OrgID:                   orgID,
+					OrgKey:                  config.OrgKey.ValueString(),
+					ProviderID:              int32ToString(config.ProviderId),
+					ProviderConfigurationID: int32ToString(config.ProviderConfigurationId),
+					LockPath:                lockPath,
+					PPID:                    os.Getppid(),
+				}
+				shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+				registerSIGTERMHandler(shutdownCtx, shutdownCancel, p.Client.Observer, existingRunID, existingState)
+				providerLog("SIGTERM handler registered for existing run_id=%s", existingRunID)
+			}
 		}
+		return diags
 	}
-	return "unknown"
-}
+	providerLog("lifecycle start run_id=%s pid=%d ppid=%d", runID, os.Getpid(), os.Getppid())
 
-func getParentCommandLine(pid int) (string, error) {
-	return getParentCommandLinePlatform(pid)
+	orgID := strconv.FormatInt(int64(config.OrgId.ValueInt32()), 10)
+
+	c := collectors.NewCollector(collectors.DefaultCollectConfig())
+	c.TrackedBranch = config.TrackedBranch.ValueString()
+	c.TrackedRepo = config.TrackedRepo.ValueString()
+	collectCtx, collectCancel := context.WithTimeout(ctx, 8*time.Second)
+	result := c.Collect(collectCtx)
+	collectCancel()
+
+	_, postErr := p.Client.Observer.Post(ctx, observer.ObserverPayload{
+		RunID:         runID,
+		Status:        "open",
+		CollectedAt:   time.Now().UTC().Format(time.RFC3339),
+		Action:        operation,
+		OrgID:         orgID,
+		ProviderCfgID: int32ToString(config.ProviderConfigurationId),
+	})
+	if postErr != nil {
+		providerLog("POST /open FAILED: %v", postErr)
+		os.Remove(lockPath)
+		diags.AddWarning("ManifestIT open event failed", postErr.Error())
+		return diags
+	}
+	providerLog("POST /open OK run_id=%s", runID)
+
+	state := runState{
+		RunID:                   runID,
+		Action:                  operation,
+		APIKey:                  config.ApiKey.ValueString(),
+		BaseURL:                 config.ApiUrl.ValueString(),
+		OrgID:                   orgID,
+		OrgKey:                  config.OrgKey.ValueString(),
+		ProviderID:              int32ToString(config.ProviderId),
+		ProviderConfigurationID: int32ToString(config.ProviderConfigurationId),
+		LockPath:                lockPath,
+		PPID:                    os.Getppid(),
+		Identity:                result.Identity,
+		Git:                     result.Git,
+	}
+
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	registerSIGTERMHandler(shutdownCtx, shutdownCancel, p.Client.Observer, runID, state)
+	providerLog("SIGTERM handler registered")
+
+	statePath, err := writeRunState(state)
+	if err != nil {
+		providerLog("watcher state write FAILED: %v", err)
+		diags.AddWarning("ManifestIT watcher state write failed", err.Error())
+		return diags
+	}
+	if err := spawnWatcher(statePath); err != nil {
+		providerLog("watcher spawn FAILED: %v", err)
+		os.Remove(statePath)
+		diags.AddWarning("ManifestIT watcher spawn failed", err.Error())
+		return diags
+	}
+	providerLog("watcher spawned ppid=%d", os.Getppid())
+	return diags
 }
 
 func observerLockPath() string {
-	ppid := os.Getppid()
-	return filepath.Join(os.TempDir(), fmt.Sprintf("manifestit-observer-%d.lock", ppid))
+	dir := stateDir()
+	_ = os.MkdirAll(dir, 0700)
+	return filepath.Join(dir, fmt.Sprintf("observer-%d.lock", os.Getppid()))
 }
 
-// alreadyPostedForParent uses atomic file creation (O_CREATE|O_EXCL) to
-// deduplicate across plan and apply provider invocations within a single
-// terraform command. Reclaims stale locks from crashed runs.
-func alreadyPostedForParent() bool {
-	lockPath := observerLockPath()
+// acquireRunLock atomically creates a per-PPID lock file using os.Link.
+// Returns alreadyPosted=true if another plugin instance for the same terraform
+// run already owns the lock.
+func acquireRunLock() (runID, lockPath string, alreadyPosted bool) {
+	lockPath = observerLockPath()
+	runID = generateRunID()
 
 	ppid := os.Getppid()
-	ppidStr := strconv.Itoa(ppid)
+	content := fmt.Sprintf("%d:%s", ppid, runID)
+	dir := filepath.Dir(lockPath)
 
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		f.Write([]byte(ppidStr))
-		return false
+	tmp, err := os.CreateTemp(dir, ".lock-tmp-")
+	if err != nil {
+		return "", lockPath, true
+	}
+	tmpPath := tmp.Name()
+	fmt.Fprint(tmp, content)
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	if err := os.Link(tmpPath, lockPath); err == nil {
+		return runID, lockPath, false
 	}
 
-	// Stale lock recovery: if the terraform parent process is dead, reclaim.
-	data, readErr := os.ReadFile(lockPath)
-	if readErr == nil {
-		if ownerPPID, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil {
-			if !processExists(ownerPPID) {
-				os.Remove(lockPath)
-				f2, retryErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-				if retryErr == nil {
-					defer f2.Close()
-					f2.Write([]byte(ppidStr))
-					return false
-				}
-			}
-		}
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return "", lockPath, true
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	if len(parts) < 1 {
+		return "", lockPath, true
+	}
+	ownerPPID, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return "", lockPath, true
+	}
+	if processExists(ownerPPID) {
+		return "", lockPath, true
 	}
 
-	return true
+	// Stale lock from a dead terraform run — reclaim.
+	os.Remove(lockPath)
+	if err := os.Link(tmpPath, lockPath); err != nil {
+		return "", lockPath, true
+	}
+	check, err := os.ReadFile(lockPath)
+	if err != nil || strings.TrimSpace(string(check)) != content {
+		return "", lockPath, true
+	}
+	return runID, lockPath, false
+}
+
+func generateRunID() string {
+	return uuid.New().String()
 }
 
 func processExists(pid int) bool {
 	return processExistsPlatform(pid)
+}
+
+func int32ToString(v types.Int32) string {
+	if v.IsNull() {
+		return ""
+	}
+	return strconv.FormatInt(int64(v.ValueInt32()), 10)
 }

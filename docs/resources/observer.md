@@ -2,14 +2,14 @@
 page_title: "manifestit_observer Resource - ManifestIT"
 subcategory: ""
 description: |-
-  Activates the ManifestIT observer for Terraform operation tracking.
+  No-op resource that activates the ManifestIT observer lifecycle.
 ---
 
 # manifestit_observer (Resource)
 
-Activates the ManifestIT observer. This is a no-op resource that triggers the provider's data collection and posting on every Terraform operation (apply, destroy).
+A no-op resource whose only purpose is to trigger the provider `Configure()` call, which fires the `open` event and starts the watcher subprocess.
 
-The provider automatically collects and posts identity, git context, and operational metadata when this resource is present in the configuration.
+The `closed` event fires when terraform itself exits — after **all** resources across all providers finish. No `depends_on` required.
 
 ## Example Usage
 
@@ -21,4 +21,4 @@ resource "manifestit_observer" "this" {}
 
 ### Read-Only
 
-- `id` (String) - Static identifier for the observer resource.
+- `id` (String) — Static identifier, always `"manifestit-observer"`.
