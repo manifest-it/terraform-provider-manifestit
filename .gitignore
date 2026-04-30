@@ -4,7 +4,7 @@
 # excluding example env
 !.env.example
 *.toml
-.idea
+.idea/
 bin/
 __debug_*
 internal/.DS_Store
@@ -14,7 +14,6 @@ kube-deployment.yaml
 .claude
 bin
 scripts
-
 # Terraform
 *.tfstate
 *.tfstate.backup

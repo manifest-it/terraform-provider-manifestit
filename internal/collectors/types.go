@@ -49,6 +49,7 @@ type GitContext struct {
 	Dirty       bool   `json:"dirty"`                  // uncommitted changes?
 	RemoteURL   string `json:"remote_url"`             // origin remote URL (sanitized, auto-detected)
 	TrackedRepo string `json:"tracked_repo,omitempty"` // user-configured repository URL
+	TrackedDir  string `json:"tracked_dir,omitempty"`  // repo-relative path of the Terraform directory being checked
 
 	// Tracked branch compliance (only populated when tracked_branch is configured)
 	TrackedBranch       string    `json:"tracked_branch,omitempty"` // configured primary branch name
@@ -124,9 +125,15 @@ type GitRepo interface {
 	HeadHash() (string, error)
 	HeadBranch() (branch string, detached bool, err error)
 	IsDirty() (bool, error)
+	// IsDirtyPath is like IsDirty but scoped to repoRelPath (repo-relative, forward-slash separated).
+	// An empty repoRelPath behaves identically to IsDirty().
+	IsDirtyPath(repoRelPath string) (bool, error)
 	RemoteURL(name string) (string, error)
 	BranchCommit(branch string) (*CommitInfo, string, error)
 	CommitCounts(refA, refB string) (ahead int, behind int, err error)
+	// CommitCountsForPath counts ahead/behind commits that touch repoRelPath.
+	// An empty repoRelPath behaves identically to CommitCounts().
+	CommitCountsForPath(headHash, trackedHash, repoRelPath string) (ahead int, behind int, err error)
 	Close()
 }
 
@@ -181,6 +188,11 @@ type Collector struct {
 	GitOp         GitOpener
 	TrackedBranch string
 	TrackedRepo   string
+	// WorkDir is the absolute path to the Terraform working directory.
+	// When set, dirty checks and commit counts are scoped to files under this
+	// directory only, enabling per-directory compliance in monorepos where
+	// multiple Terraform root modules share the same Git repository.
+	WorkDir string
 }
 
 // NewCollector creates a Collector with real OS dependencies.
