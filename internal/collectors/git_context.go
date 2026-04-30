@@ -54,6 +54,10 @@ func (r *goGitRepo) HeadBranch() (string, bool, error) {
 }
 
 func (r *goGitRepo) IsDirty() (bool, error) {
+	return r.IsDirtyPath("")
+}
+
+func (r *goGitRepo) IsDirtyPath(repoRelPath string) (bool, error) {
 	w, err := r.repo.Worktree()
 	if err != nil {
 		return false, err
@@ -62,7 +66,23 @@ func (r *goGitRepo) IsDirty() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !status.IsClean(), nil
+	if repoRelPath == "" {
+		return !status.IsClean(), nil
+	}
+	// Normalise to forward slashes for consistent prefix matching.
+	prefix := filepath.ToSlash(repoRelPath)
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	for file, s := range status {
+		f := filepath.ToSlash(file)
+		if f == filepath.ToSlash(repoRelPath) || strings.HasPrefix(f, prefix) {
+			if s.Worktree != git.Unmodified || s.Staging != git.Unmodified {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (r *goGitRepo) RemoteURL(name string) (string, error) {
@@ -105,6 +125,10 @@ func (r *goGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
 
 
 func (r *goGitRepo) CommitCounts(headHash, trackedHash string) (ahead int, behind int, err error) {
+	return r.CommitCountsForPath(headHash, trackedHash, "")
+}
+
+func (r *goGitRepo) CommitCountsForPath(headHash, trackedHash, repoRelPath string) (ahead int, behind int, err error) {
 	headCommit, err := r.repo.CommitObject(plumbing.NewHash(headHash))
 	if err != nil {
 		return 0, 0, err
@@ -141,17 +165,78 @@ func (r *goGitRepo) CommitCounts(headHash, trackedHash string) (ahead int, behin
 	// Ahead = commits in HEAD not in tracked
 	for h := range headAncestors {
 		if !trackedAncestors[h] {
-			ahead++
+			if repoRelPath == "" {
+				ahead++
+			} else if c, e := r.repo.CommitObject(h); e == nil && r.commitTouchesPath(c, repoRelPath) {
+				ahead++
+			}
 		}
 	}
 	// Behind = commits in tracked not in HEAD
 	for h := range trackedAncestors {
 		if !headAncestors[h] {
-			behind++
+			if repoRelPath == "" {
+				behind++
+			} else if c, e := r.repo.CommitObject(h); e == nil && r.commitTouchesPath(c, repoRelPath) {
+				behind++
+			}
 		}
 	}
 
 	return ahead, behind, nil
+}
+
+// commitTouchesPath reports whether commit modifies any file under repoRelPath.
+func (r *goGitRepo) commitTouchesPath(commit *object.Commit, repoRelPath string) bool {
+	if repoRelPath == "" {
+		return true
+	}
+	prefix := filepath.ToSlash(repoRelPath)
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	matchesPath := func(name string) bool {
+		n := filepath.ToSlash(name)
+		return n == filepath.ToSlash(repoRelPath) || strings.HasPrefix(n, prefix)
+	}
+
+	currentTree, err := commit.Tree()
+	if err != nil {
+		return false
+	}
+
+	// Initial commit — any file under the path counts.
+	if len(commit.ParentHashes) == 0 {
+		found := false
+		_ = currentTree.Files().ForEach(func(f *object.File) error {
+			if matchesPath(f.Name) {
+				found = true
+				return fmt.Errorf("stop")
+			}
+			return nil
+		})
+		return found
+	}
+
+	parent, err := r.repo.CommitObject(commit.ParentHashes[0])
+	if err != nil {
+		return false
+	}
+	parentTree, err := parent.Tree()
+	if err != nil {
+		return false
+	}
+
+	changes, err := parentTree.Diff(currentTree)
+	if err != nil {
+		return false
+	}
+	for _, change := range changes {
+		if matchesPath(change.From.Name) || matchesPath(change.To.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *goGitRepo) Close() {}
@@ -166,6 +251,39 @@ func (c *Collector) CollectGitContext(ctx context.Context) GitContext {
 		return GitContext{Available: false}
 	}
 
+	// Resolve the repo-relative path to scope dirty / commit-count checks to the
+	// Terraform directory being executed. Resolution order:
+	//
+	//  1. explicit tracked_dir  — user override (absolute path set via provider config)
+	//  2. os.Getwd()            — auto-detect: Terraform always runs from the module
+	//                             directory, so cwd IS the terraform dir within the repo
+	//  3. git root (fallback)   — if cwd is somehow outside the repo, check everything
+	repoRelPath := ""
+	workDir := c.WorkDir
+	if workDir == "" {
+		workDir, _ = os.Getwd() // best-effort; empty string falls back to full-repo
+	}
+	if workDir != "" {
+		rel, relErr := filepath.Rel(dir, workDir)
+		if relErr == nil && !strings.HasPrefix(rel, "..") {
+			repoRelPath = filepath.ToSlash(rel)
+			// "." means the terraform dir IS the git root → no path filtering needed
+			if repoRelPath == "." {
+				repoRelPath = ""
+			}
+		} else {
+			tflog.Debug(ctx, "work dir is outside repository root — checking full repo",
+				map[string]interface{}{"work_dir": workDir, "git_root": dir})
+		}
+	}
+
+	tflog.Debug(ctx, "git context: resolved terraform directory",
+		map[string]interface{}{
+			"git_root":     dir,
+			"work_dir":     workDir,
+			"repo_rel_path": repoRelPath,
+		})
+
 	// Try go-git first
 	opener := c.GitOp
 	if opener == nil {
@@ -175,15 +293,15 @@ func (c *Collector) CollectGitContext(ctx context.Context) GitContext {
 	repo, err := opener.Open(dir)
 	if err == nil {
 		defer repo.Close()
-		return c.collectGitFromRepo(ctx, repo)
+		return c.collectGitFromRepo(ctx, repo, repoRelPath)
 	}
 	tflog.Debug(ctx, "go-git failed, falling back to CLI", map[string]interface{}{"error": err.Error()})
 
 	// Fallback to CLI
-	return c.collectGitFromCLI(ctx, dir)
+	return c.collectGitFromCLI(ctx, dir, repoRelPath)
 }
 
-func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitContext {
+func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo, repoRelPath string) GitContext {
 	gc := GitContext{Available: true}
 
 	if hash, err := repo.HeadHash(); err == nil {
@@ -198,7 +316,7 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 		}
 	}
 
-	if dirty, err := repo.IsDirty(); err == nil {
+	if dirty, err := repo.IsDirtyPath(repoRelPath); err == nil {
 		gc.Dirty = dirty
 	}
 
@@ -207,6 +325,7 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 	}
 
 	gc.TrackedRepo = c.TrackedRepo
+	gc.TrackedDir = repoRelPath
 
 	// Validate repo: skip compliance check if running from wrong repository
 	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
@@ -231,7 +350,7 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 			gc.IsCurrentBranch = gc.Branch == c.TrackedBranch
 
 			if gc.Commit != "" {
-				if ahead, behind, err := repo.CommitCounts(gc.Commit, hash); err == nil {
+				if ahead, behind, err := repo.CommitCountsForPath(gc.Commit, hash, repoRelPath); err == nil {
 					gc.CommitsAhead = ahead
 					gc.CommitsBehind = behind
 				}
@@ -256,7 +375,7 @@ func (c *Collector) collectGitFromRepo(ctx context.Context, repo GitRepo) GitCon
 	return gc
 }
 
-func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContext {
+func (c *Collector) collectGitFromCLI(ctx context.Context, dir string, repoRelPath string) GitContext {
 	gc := GitContext{Available: true}
 
 	run := func(args ...string) string {
@@ -276,13 +395,19 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 		gc.Branch = branch
 	}
 
-	gc.Dirty = run("status", "--porcelain") != ""
+	// Scope dirty check to the tracked directory when configured.
+	if repoRelPath != "" {
+		gc.Dirty = run("status", "--porcelain", "--", repoRelPath) != ""
+	} else {
+		gc.Dirty = run("status", "--porcelain") != ""
+	}
 
 	if remoteURL := run("remote", "get-url", "origin"); remoteURL != "" {
 		gc.RemoteURL = sanitizeRemoteURL(remoteURL)
 	}
 
 	gc.TrackedRepo = c.TrackedRepo
+	gc.TrackedDir = repoRelPath
 
 	// Validate repo: skip compliance check if running from wrong repository
 	if c.TrackedRepo != "" && gc.RemoteURL != "" && !repoMatches(gc.RemoteURL, c.TrackedRepo) {
@@ -321,7 +446,12 @@ func (c *Collector) collectGitFromCLI(ctx context.Context, dir string) GitContex
 				}
 			}
 
-			if counts := run("rev-list", "--left-right", "--count", "HEAD..."+trackedRef); counts != "" {
+			// Scope commit counts to the tracked directory when configured.
+			revListArgs := []string{"rev-list", "--left-right", "--count", "HEAD..." + trackedRef}
+			if repoRelPath != "" {
+				revListArgs = append(revListArgs, "--", repoRelPath)
+			}
+			if counts := run(revListArgs...); counts != "" {
 				parts := strings.Fields(counts)
 				if len(parts) == 2 {
 					gc.CommitsAhead, _ = strconv.Atoi(parts[0])

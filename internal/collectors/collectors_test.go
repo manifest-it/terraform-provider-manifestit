@@ -66,8 +66,9 @@ func (m *mockGitRepo) HeadBranch() (string, bool, error) {
 	}
 	return m.branch, false, nil
 }
-func (m *mockGitRepo) IsDirty() (bool, error)            { return m.dirty, nil }
-func (m *mockGitRepo) RemoteURL(_ string) (string, error) { return m.remote, nil }
+func (m *mockGitRepo) IsDirty() (bool, error)                 { return m.dirty, nil }
+func (m *mockGitRepo) IsDirtyPath(_ string) (bool, error)     { return m.dirty, nil }
+func (m *mockGitRepo) RemoteURL(_ string) (string, error)     { return m.remote, nil }
 func (m *mockGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
 	if bc, ok := m.branchCommits[branch]; ok {
 		return bc.info, bc.hash, nil
@@ -75,6 +76,9 @@ func (m *mockGitRepo) BranchCommit(branch string) (*CommitInfo, string, error) {
 	return nil, "", fmt.Errorf("branch %s not found", branch)
 }
 func (m *mockGitRepo) CommitCounts(_, _ string) (int, int, error) {
+	return m.commitsAhead, m.commitsBehind, nil
+}
+func (m *mockGitRepo) CommitCountsForPath(_, _, _ string) (int, int, error) {
 	return m.commitsAhead, m.commitsBehind, nil
 }
 func (m *mockGitRepo) Close() {}
@@ -257,7 +261,7 @@ func TestCollectGitFromRepo(t *testing.T) {
 		Env:    &mockEnvReader{vars: map[string]string{}},
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if !gc.Available {
 		t.Error("expected available=true")
@@ -289,7 +293,7 @@ func TestCollectGitFromRepo_DetachedHead_ResolvesFromCI(t *testing.T) {
 		}},
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if gc.Branch != "feature-branch" {
 		t.Errorf("expected branch 'feature-branch' from CI env, got %q", gc.Branch)
@@ -351,7 +355,7 @@ func TestCollectGitFromRepo_TrackedBranch_OnMain(t *testing.T) {
 		TrackedBranch: "main",
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if gc.TrackedBranch != "main" {
 		t.Errorf("expected tracked_branch 'main', got %q", gc.TrackedBranch)
@@ -400,7 +404,7 @@ func TestCollectGitFromRepo_TrackedBranch_FeatureBranch(t *testing.T) {
 		TrackedBranch: "main",
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if !gc.DriftDetected {
 		t.Error("expected drift_detected=true on feature branch with unpushed commits")
@@ -432,7 +436,7 @@ func TestCollectGitFromRepo_NoTrackedBranch(t *testing.T) {
 		// TrackedBranch not set
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if gc.TrackedBranch != "" {
 		t.Errorf("expected empty tracked_branch when not configured, got %q", gc.TrackedBranch)
@@ -473,7 +477,7 @@ func TestCollectGitFromRepo_RepoMismatch(t *testing.T) {
 		TrackedRepo:   "https://github.com/org/infra",
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if !gc.RepoMismatch {
 		t.Error("expected repo_mismatch=true when remote doesn't match tracked_repo")
@@ -520,7 +524,7 @@ func TestCollectGitFromRepo_RepoMatch(t *testing.T) {
 		TrackedRepo:   "https://github.com/org/infra",
 	}
 
-	gc := c.collectGitFromRepo(context.Background(), repo)
+	gc := c.collectGitFromRepo(context.Background(), repo, "")
 
 	if gc.RepoMismatch {
 		t.Error("expected repo_mismatch=false when SSH remote matches HTTPS tracked_repo")
